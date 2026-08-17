@@ -35,6 +35,9 @@ sbx diagnose                # should report all checks passing
 Docs: [install](https://docs.docker.com/ai/sandboxes/install/) ·
 [getting started](https://docs.docker.com/ai/sandboxes/get-started/)
 
+Setup also asks you to pick a global network policy — see
+[Network policy](#network-policy) below. Pick `balanced`.
+
 ### 2. Host dependencies
 
 `sbx`, `jq`, `git` and `awk`. The script checks for these on startup and exits
@@ -66,6 +69,96 @@ Create `TASKS.md` in the repo you want worked on, one checkbox per item:
 Keep each item small enough for a fresh context window to finish in a few turns.
 **Commit it** — in clone mode the sandbox clones your committed checked-out ref,
 so uncommitted changes are invisible to the agent.
+
+---
+
+## Network policy
+
+The sandbox is a microVM, but the interesting boundary for an unattended agent is
+the network one. All outbound TCP from a sandbox is proxied through the host and
+authorised against a policy; UDP, ICMP, the host Docker daemon and
+sandbox-to-sandbox traffic are blocked outright and cannot be opened up.
+
+That policy is chosen **once**, during setup, and it is global: **every sandbox
+afk creates uses it**, including ones you create later for other repos. afk never
+sets it — `afk smoke` and `afk loop` inherit whatever the host was initialised
+with. Set it before your first run:
+
+```bash
+sbx policy init balanced     # recommended
+sbx policy ls                # what is actually in force
+```
+
+| Policy | What it allows |
+|---|---|
+| `allow-all` | All outbound traffic |
+| `balanced` | Typical development traffic — AI services, package registries |
+| `deny-all` | Nothing outbound; you allow destinations one at a time |
+
+**Use at least `balanced`.** `allow-all` gives an agent running with permission
+prompts disabled a completely open egress path for the length of an unattended
+run, which is the one thing the VM boundary was supposed to buy you back.
+`deny-all` is the safest and is a fine place to start from, but nothing works
+until you allow the agent's API endpoint and every registry the repo pulls from —
+expect `afk smoke` to fail until you have.
+
+`init` is one-time. To start over: `sbx policy reset`, then `init` again.
+
+### Widening it
+
+Deny beats allow, and rules are global unless you scope them. Resources are
+hostnames, wildcard subdomains or IPs, comma-separated, with an optional port:
+
+```bash
+sbx policy allow network api.example.com            # one host, all sandboxes
+sbx policy allow network "*.npmjs.org"              # wildcard subdomains
+sbx policy allow network "api.example.com:443,cdn.example.com"
+sbx policy allow network --sandbox my-project internal.corp   # one sandbox only
+```
+
+Use `--sandbox "$BOX"` for anything a single repo needs — a private registry, an
+internal API — so one project's dependency does not become every project's
+egress. Check before you debug:
+
+```bash
+sbx policy check network --sandbox my-project https://api.example.com
+sbx policy ls my-project              # rules in force for that sandbox
+sbx policy log                        # what actually got blocked
+```
+
+A blocked destination usually shows up as a hang or an opaque network error
+inside an iteration, not as a policy message, so `sbx policy log` is the first
+thing to read when an iteration fails for no visible reason.
+
+### Restricting it
+
+Narrowing works the same way, and a deny always wins:
+
+```bash
+sbx policy deny network ads.example.com                       # all sandboxes
+sbx policy deny network --sandbox my-project "*.slack.com"    # one sandbox
+sbx policy rm network --resource api.example.com              # drop an allow rule
+sbx policy ls --wide                                          # rule IDs, for --id
+```
+
+You can also pin the restriction to the sandbox at creation time with
+`sbx create --deny-network`. afk does not expose that flag, so either create the
+sandbox yourself first (afk reuses a sandbox that already exists under `$BOX`)
+or add the rules afterwards with `--sandbox`:
+
+```bash
+sbx create --clone --name my-project --deny-network "*.example.com" claude "$PWD"
+BOX=my-project afk loop
+```
+
+Per-sandbox denies can only narrow egress, never widen it, so they are safe to
+add on a host under centralised governance — where org rules take precedence
+over your local ones and some rules are read-only. `sbx policy inspect <rule>`
+tells you whether a given rule is yours to remove.
+
+Docs: [security](https://docs.docker.com/ai/sandboxes/security/) ·
+[defaults](https://docs.docker.com/ai/sandboxes/security/defaults/) ·
+[`sbx policy`](https://docs.docker.com/reference/cli/sbx/)
 
 ---
 
@@ -244,6 +337,10 @@ stopped.
   the agent will find work from the previous run already done and immediately
   report `ALL_DONE`. Use `afk reset` to remove the sandbox and start a clean run.
 - **Commit `TASKS.md` before running.** The clone only sees committed state.
+- **The network policy is global and not per-repo.** A host initialised with
+  `allow-all` gives every afk run open egress; one initialised with `deny-all`
+  fails `afk smoke` until you allow the agent's endpoint. See
+  [Network policy](#network-policy).
 - **The repo you are standing in is the repo that gets worked on.** There is no
   way to aim afk elsewhere — `cd` first. It prints the repository it resolved
   before doing anything, so check that line if you are unsure.
