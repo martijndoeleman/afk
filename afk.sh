@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# afk-loop.sh — run a coding agent headlessly, over and over, inside one
+# afk.sh — run a coding agent headlessly, over and over, inside one
 # long-lived sbx sandbox. Defaults to Claude Code; see AGENT.
 #
 # Each iteration is a fresh process, so the context window starts empty every
@@ -8,13 +8,16 @@
 # not from conversation history.
 #
 # Every setting below can be overridden from the environment, e.g.:
-#   MAX_ITERS=2 BOX=test-box ./afk-loop.sh
+#   MAX_ITERS=2 BOX=test-box afk loop
 #
 # Subcommands:
-#   ./afk-loop.sh smoke    # verify sandbox + auth + network, no real work
-#   ./afk-loop.sh shell    # drop into the sandbox to poke around
-#   ./afk-loop.sh reset    # destroy the sandbox and start clean
-#   ./afk-loop.sh          # run the loop
+#   afk loop     # run the loop
+#   afk smoke    # verify sandbox + auth + network, no real work
+#   afk shell    # drop into the sandbox to poke around
+#   afk reset    # destroy the sandbox and start clean
+#
+# Installed as `afk` by install.sh; run it as ./afk.sh if you'd rather not
+# install it. Both take the same subcommands.
 
 set -uo pipefail
 
@@ -23,20 +26,19 @@ set -uo pipefail
 # ==============================================================================
 
 # --- sandbox ---
-BOX="${BOX:-afk-loop}"              # sandbox name (one per project)
+BOX="${BOX:-afk}"                   # sandbox name (one per project)
 # Used both as the sbx agent type (sbx create <AGENT>) and as the CLI to run
 # inside the box. sbx offers claude, codex, copilot, cursor, docker-agent,
 # droid, gemini, kiro, opencode, shell. Swapping this alone is not enough —
 # see AGENT_FLAGS and the result parsing in cmd_loop, both of which still
 # assume Claude Code's flags and JSON schema.
 AGENT="${AGENT:-claude}"
-WORKSPACE="${WORKSPACE:-.}"            # host dir to mount as the workspace
-# Must be absolute AND correctly cased: macOS is case-insensitive but the Linux
-# VM is not, so mounting /Users/me/developer when the real directory is
-# /Users/me/Developer makes sandbox creation fail. /bin/pwd (not the bash
-# builtin, which just echoes $PWD back) calls getcwd() and returns the real one.
-WORKSPACE="$(cd "$WORKSPACE" && /bin/pwd -P)" || { echo "no such directory: $WORKSPACE" >&2; exit 1; }
-USE_CLONE="${USE_CLONE:-1}"            # 1 = private in-VM git clone, 0 = mount directly
+# There is deliberately no WORKSPACE setting. afk works on the repository you
+# run it from, so the mounted directory, the branch fetch target and LOG_DIR are
+# the same place by construction. When they could differ, the only thing a
+# WORKSPACE override bought you was mounting one repo and delivering the results
+# to another. To work on a different repo, cd to it — see resolve_repo.
+USE_CLONE="${USE_CLONE:-1}"            # 1 = private in-VM clone, 0 = mount directly
 BRANCH="${BRANCH:-agent-loop}"         # branch the agent commits to
 CPUS="${CPUS:-0}"                      # 0 = auto (all host CPUs)
 MEMORY="${MEMORY:-}"                   # e.g. 8g; empty = sbx default
@@ -86,6 +88,28 @@ die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
 
+# The repository afk operates on: the one containing the current directory.
+# We move to its root and stay there, so everything downstream — the directory
+# mounted into the VM, the `git fetch` that brings the branch back, LOG_DIR,
+# and TASK_FILE — resolves against one path with no way for them to disagree.
+#
+# Root, not the current directory: running from a subdirectory would otherwise
+# mount that subdirectory, and `sbx create --clone` needs a git root to clone.
+#
+# The path must be absolute AND correctly cased: macOS is case-insensitive but
+# the Linux VM is not, so mounting /Users/me/developer when the real directory
+# is /Users/me/Developer makes sandbox creation fail. /bin/pwd (not the bash
+# builtin, which just echoes $PWD back) calls getcwd() and returns the real one.
+REPO=""
+resolve_repo() {
+  local top
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" \
+    || die "not inside a git repository — cd into the repo you want worked on"
+  [[ -n "$top" ]] || die "no repository root here (a bare repo?) — cd into a working tree"
+  REPO="$(cd "$top" && /bin/pwd -P)" || die "cannot enter repository root: $top"
+  cd "$REPO" || die "cannot enter repository root: $REPO"
+}
+
 box_exists() { sbx ls -q 2>/dev/null | grep -qx "$BOX"; }
 
 ensure_box() {
@@ -100,7 +124,7 @@ ensure_box() {
   [[ "$USE_CLONE" == "1" ]] && args+=(--clone)
   [[ "$CPUS" != "0" ]]      && args+=(--cpus "$CPUS")
   [[ -n "$MEMORY" ]]        && args+=(-m "$MEMORY")
-  args+=("$AGENT" "$WORKSPACE")
+  args+=("$AGENT" "$REPO")
   sbx create "${args[@]}" || die "sandbox creation failed"
 }
 
@@ -263,7 +287,7 @@ cmd_loop() {
     local after; after=$(head_sha)
     if [[ "$STOP_ON_NO_COMMIT" == "1" && "$before" == "$after" ]]; then
       warn "no commit this iteration — likely stuck; stopping"
-      warn "inspect with: ./afk-loop.sh shell"
+      warn "inspect with: $(basename "$0") shell"
       break
     fi
     in_box git log --oneline -1
@@ -305,12 +329,37 @@ extract() {
 
 # ==============================================================================
 
+usage() {
+  local me; me="$(basename "$0")"
+  cat <<EOF
+usage: $me <command>
+
+  loop     work through $TASK_FILE, one item per iteration, until it is done
+  smoke    verify sandbox + auth + network + model. Do this first.
+  shell    drop into the sandbox to poke around
+  reset    destroy the sandbox so the next run starts clean
+
+Runs against the repository you are currently in — cd there first. Settings are
+environment variables, e.g. MAX_ITERS=3 MODEL=sonnet $me loop — see the README.
+EOF
+}
+
+# No bare default: `loop` starts a long, billable run, so it has to be asked
+# for by name rather than being what you get for typing the command alone.
+# Help works without the dependencies installed, so it comes first.
+case "${1:-}" in
+  ""|help|-h|--help) usage; exit 0 ;;
+esac
+
 need sbx; need jq; need git; need awk
 
-case "${1:-loop}" in
+resolve_repo
+log "repository: $REPO"
+
+case "$1" in
+  loop)  cmd_loop  ;;
   smoke) cmd_smoke ;;
   shell) cmd_shell ;;
   reset) cmd_reset ;;
-  loop)  cmd_loop  ;;
-  *)     die "unknown command: $1 (use: loop | smoke | shell | reset)" ;;
+  *)     usage >&2; die "unknown command: $1" ;;
 esac
