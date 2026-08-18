@@ -5,16 +5,19 @@
 #
 # Each iteration is a fresh process, so the context window starts empty every
 # time. Continuity comes from files + git history inside the sandbox's clone,
-# not from conversation history.
+# not from conversation history — primarily from $PROMPT_FILE, the single input:
+# one file that both describes the task items and says how to work through
+# them. It is sent to the agent verbatim as the prompt, every iteration.
 #
 # Every setting below can be overridden from the environment, e.g.:
 #   MAX_ITERS=2 BOX=test-box afk loop
 #
 # Subcommands:
-#   afk loop     # run the loop
-#   afk smoke    # verify sandbox + auth + network, no real work
-#   afk shell    # drop into the sandbox to poke around
-#   afk reset    # destroy the sandbox and start clean
+#   afk loop            # run the loop
+#   afk prompt <text>   # run the agent once on an ad-hoc prompt
+#   afk smoke           # verify sandbox + auth + network, no real work
+#   afk shell           # drop into the sandbox to poke around
+#   afk remove          # destroy the sandbox and start clean
 #
 # Installed as `afk` by install.sh; run it as ./afk.sh if you'd rather not
 # install it. Both take the same subcommands.
@@ -50,30 +53,19 @@ SLEEP_BETWEEN="${SLEEP_BETWEEN:-0}"    # seconds between iterations
 STOP_ON_NO_COMMIT="${STOP_ON_NO_COMMIT:-1}"  # bail if an iteration commits nothing
 
 # --- the task ---
-TASK_FILE="${TASK_FILE:-TASKS.md}"
+# $PROMPT_FILE is the only input. It is the prompt: its prose says how to work on
+# this repository, its checklist says what to work on, and the loop sends it to
+# the agent verbatim, every iteration. There is no separate prompt setting —
+# instructions and task list are edited, reviewed and committed together, and
+# two inputs only gave them a way to disagree.
+#
+# Because it is used verbatim, nothing in it is interpolated: it has to spell
+# out $DONE_SENTINEL itself, or the loop can never detect that the work is
+# finished. load_prompt checks that before spending anything.
+PROMPT_FILE="${PROMPT_FILE:-PROMPT.md}"
 DONE_SENTINEL="${DONE_SENTINEL:-ALL_DONE}"
 MODEL="${MODEL:-}"                     # empty = the agent profile's default (claude: opus)
 EFFORT="${EFFORT:-medium}"             # low | medium | high | xhigh | max; empty = default
-
-PROMPT="${PROMPT:-$(cat <<EOF
-Read ${TASK_FILE}. Pick the first item not marked [x] and complete it.
-Mark it [x] and commit your work with a descriptive message.
-Do exactly ONE item, then stop.
-If every item is already [x], reply with exactly: ${DONE_SENTINEL}
-EOF
-)}"
-
-# Optional: read the prompt from a file instead, e.g. PROMPT_FILE=prompt.md.
-# Read on the host, so the file does not need to exist inside the sandbox. Its
-# contents are used verbatim — unlike the default above, ${TASK_FILE} and
-# ${DONE_SENTINEL} are NOT interpolated, so write the sentinel out in full or
-# the loop will never detect that the work is finished.
-PROMPT_FILE="${PROMPT_FILE:-}"
-if [[ -n "$PROMPT_FILE" ]]; then
-  PROMPT="$(cat "$PROMPT_FILE")" || { echo "cannot read PROMPT_FILE: $PROMPT_FILE" >&2; exit 1; }
-  [[ "$PROMPT" == *"$DONE_SENTINEL"* ]] \
-    || echo "warning: $PROMPT_FILE never mentions $DONE_SENTINEL — the loop can only stop on MAX_ITERS" >&2
-fi
 
 # --- output ---
 LOG_DIR="${LOG_DIR:-./.afk-logs}"
@@ -91,7 +83,7 @@ need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
 # The repository afk operates on: the one containing the current directory.
 # We move to its root and stay there, so everything downstream — the directory
 # mounted into the VM, the `git fetch` that brings the branch back, LOG_DIR,
-# and TASK_FILE — resolves against one path with no way for them to disagree.
+# and PROMPT_FILE — resolves against one path with no way for them to disagree.
 #
 # Root, not the current directory: running from a subdirectory would otherwise
 # mount that subdirectory, and `sbx create --clone` needs a git root to clone.
@@ -133,6 +125,26 @@ ensure_box() {
 in_box() { sbx exec "$BOX" "$@"; }
 
 head_sha() { in_box git rev-parse HEAD 2>/dev/null | tr -d '\r\n'; }
+
+# The prompt is $PROMPT_FILE, read from inside the sandbox rather than from the
+# host: in clone mode the agent reads and rewrites the VM's committed copy, so
+# reading that same copy is what stops the prompt describing a task list the
+# agent cannot see. It also catches the common mistake — editing PROMPT.md and
+# forgetting to commit — as an empty or stale prompt at iteration 1, before any
+# money is spent.
+PROMPT=""
+SENTINEL_WARNED=""
+load_prompt() {
+  in_box test -f "$PROMPT_FILE" \
+    || die "$PROMPT_FILE not found in the sandbox workspace — commit it, then \`$(basename "$0") remove\`"
+  PROMPT="$(in_box cat "$PROMPT_FILE")" || die "could not read $PROMPT_FILE from the sandbox"
+  [[ -n "${PROMPT//[[:space:]]/}" ]] || die "$PROMPT_FILE is empty — it is the prompt, so there is nothing to run"
+  # Re-read every iteration, so warn once rather than on every one.
+  if [[ -z "$SENTINEL_WARNED" && "$PROMPT" != *"$DONE_SENTINEL"* ]]; then
+    SENTINEL_WARNED=1
+    warn "$PROMPT_FILE never mentions $DONE_SENTINEL — the loop can only stop on MAX_ITERS"
+  fi
+}
 
 # ==============================================================================
 # AGENT PROFILES
@@ -226,29 +238,67 @@ cmd_smoke() {
 
 cmd_shell() { ensure_box; sbx exec -it "$BOX" bash; }
 
-cmd_reset() {
+cmd_remove() {
   log "removing sandbox $BOX"
   sbx rm -f "$BOX" 2>/dev/null || true
   log "gone. next run will create it fresh."
 }
 
-cmd_loop() {
-  ensure_box
-  mkdir -p "$LOG_DIR"
-
-  # Switch to $BRANCH, creating it only if it is missing. Deliberately NOT
-  # `checkout -B`, which force-resets the branch to HEAD and would silently
-  # discard the commits a previous run left on it.
+# Switch to $BRANCH, creating it only if it is missing. Deliberately NOT
+# `checkout -B`, which force-resets the branch to HEAD and would silently
+# discard the commits a previous run left on it.
+use_branch() {
   in_box git checkout "$BRANCH" 2>/dev/null \
     || in_box git checkout -b "$BRANCH" \
     || die "could not switch to branch $BRANCH"
-  in_box test -f "$TASK_FILE" || die "$TASK_FILE not found in the sandbox workspace"
+}
 
-  build_agent_flags "$PROMPT" "$MAX_TURNS"
+# One agent run on a prompt you pass in, instead of the whole $PROMPT_FILE loop.
+# Everything else is the loop's machinery: same sandbox, same branch, and the
+# same bundle fetch at the end, so whatever it commits comes back the same way.
+# For asking a question rather than changing anything, nothing is committed and
+# extract is a no-op beyond re-fetching the branch as it was.
+cmd_prompt() {
+  local prompt="$*"
+  # No arguments and something piped in: take the prompt from stdin, so
+  # `afk prompt < brief.md` works without shell-quoting a multi-line file.
+  if [[ -z "$prompt" && ! -t 0 ]]; then prompt="$(cat)"; fi
+  [[ -n "${prompt//[[:space:]]/}" ]] \
+    || die "nothing to ask — usage: $(basename "$0") prompt <text>"
+
+  ensure_box
+  mkdir -p "$LOG_DIR"
+  use_branch
+
+  build_agent_flags "$prompt" "$MAX_TURNS"
+  local out; out=$(in_box "$AGENT" "${AGENT_FLAGS[@]}" </dev/null)
+  local status=$?
+
+  printf '%s\n' "$out" > "$LOG_DIR/prompt.json"
+
+  [[ $status -ne 0 ]] && die "$AGENT exited $status — see $LOG_DIR/prompt.json"
+  agent_failed "$out" && die "$AGENT reported an error — see $LOG_DIR/prompt.json"
+
+  printf '%s\n' "$(agent_text "$out")"
+  log "cost \$$(agent_cost "$out")"
+  in_box git log --oneline -1
+  extract
+}
+
+cmd_loop() {
+  ensure_box
+  mkdir -p "$LOG_DIR"
+  use_branch
 
   local total=0 i
   for i in $(seq 1 "$MAX_ITERS"); do
     printf '\n'; log "iteration $i / $MAX_ITERS"
+
+    # Re-read the file each time: the agent ticks items off in it, so the
+    # previous iteration's edits are exactly what tells this fresh, empty
+    # context what is left to do.
+    load_prompt
+    build_agent_flags "$PROMPT" "$MAX_TURNS"
 
     local before; before=$(head_sha)
     # </dev/null or codex reads the inherited stdin and appends it to the
@@ -334,10 +384,13 @@ usage() {
   cat <<EOF
 usage: $me <command>
 
-  loop     work through $TASK_FILE, one item per iteration, until it is done
-  smoke    verify sandbox + auth + network + model. Do this first.
-  shell    drop into the sandbox to poke around
-  reset    destroy the sandbox so the next run starts clean
+  loop            work through $PROMPT_FILE (instructions + checklist), one item
+                  per iteration, until it is done
+  prompt <text>   run the agent once on that prompt (or on stdin) instead of
+                  $PROMPT_FILE, then fetch the branch back
+  smoke           verify sandbox + auth + network + model. Do this first.
+  shell           drop into the sandbox to poke around
+  remove          destroy the sandbox so the next run starts clean
 
 Runs against the repository you are currently in — cd there first. Settings are
 environment variables, e.g. MAX_ITERS=3 MODEL=sonnet $me loop — see the README.
@@ -356,10 +409,13 @@ need sbx; need jq; need git; need awk
 resolve_repo
 log "repository: $REPO"
 
-case "$1" in
-  loop)  cmd_loop  ;;
-  smoke) cmd_smoke ;;
-  shell) cmd_shell ;;
-  reset) cmd_reset ;;
-  *)     usage >&2; die "unknown command: $1" ;;
+cmd="$1"; shift
+case "$cmd" in
+  loop)   cmd_loop   ;;
+  prompt) cmd_prompt "$@" ;;
+  smoke)  cmd_smoke  ;;
+  shell)  cmd_shell  ;;
+  remove) cmd_remove ;;
+  reset)  die "no such command: reset — it is now \`$(basename "$0") remove\`" ;;
+  *)      usage >&2; die "unknown command: $cmd" ;;
 esac
