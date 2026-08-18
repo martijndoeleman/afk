@@ -1,74 +1,67 @@
 #!/usr/bin/env bash
 #
-# afk.sh — run a coding agent headlessly, over and over, inside one
+# afk.sh — run a coding agent headlessly inside one
 # long-lived sbx sandbox. Defaults to Claude Code; see AGENT.
 #
-# Each iteration is a fresh process, so the context window starts empty every
-# time. Continuity comes from files + git history inside the sandbox's clone,
-# not from conversation history — primarily from $PROMPT_FILE, the single input:
-# one file that both describes the task items and says how to work through
-# them. It is sent to the agent verbatim as the prompt, every iteration.
+# Continuity between agent sessions inside the sandbox comes from 
+# files + git history inside the sandbox's clone, not from conversation history
 #
-# Every setting below can be overridden from the environment, e.g.:
-#   MAX_ITERS=2 BOX=test-box afk loop
+# Settings come from three places, in order: the environment, the repository's
+# .afkrc, then the built-in defaults.
+#   MAX_ITERATIONS=2 BOX=test-box afk loop     # one run
+#   afk init                              # freeze settings into ./.afkrc
 #
 # Subcommands:
-#   afk loop            # run the loop
+#   afk init            # write .afkrc for this repository
+#   afk config          # show current settings and where they come from
+#   afk loop            # run the agent in a loop with $PROMPT_FILE as instructions
 #   afk prompt <text>   # run the agent once on an ad-hoc prompt
+#   afk prompt < FILE   # the same, with the prompt read from a file
 #   afk smoke           # verify sandbox + auth + network, no real work
-#   afk shell           # drop into the sandbox to poke around
-#   afk remove          # destroy the sandbox and start clean
+#   afk shell           # drop into the sandbox's shell to poke around or do ad-hoc work
+#   afk remove          # destroy the sandbox
 #
-# Installed as `afk` by install.sh; run it as ./afk.sh if you'd rather not
+# Installed as `afk` by running install.sh; run `afk` as ./afk.sh if you'd rather not
 # install it. Both take the same subcommands.
 
 set -uo pipefail
 
 # ==============================================================================
-# CONFIG — adjust per project / task
+# SETTINGS
 # ==============================================================================
-
-# --- sandbox ---
-BOX="${BOX:-afk}"                   # sandbox name (one per project)
-# Used both as the sbx agent type (sbx create <AGENT>) and as the CLI to run
-# inside the box. sbx offers claude, codex, copilot, cursor, docker-agent,
-# droid, gemini, kiro, opencode, shell. Swapping this alone is not enough —
-# see AGENT_FLAGS and the result parsing in cmd_loop, both of which still
-# assume Claude Code's flags and JSON schema.
-AGENT="${AGENT:-claude}"
-# There is deliberately no WORKSPACE setting. afk works on the repository you
-# run it from, so the mounted directory, the branch fetch target and LOG_DIR are
-# the same place by construction. When they could differ, the only thing a
-# WORKSPACE override bought you was mounting one repo and delivering the results
-# to another. To work on a different repo, cd to it — see resolve_repo.
-USE_CLONE="${USE_CLONE:-1}"            # 1 = private in-VM clone, 0 = mount directly
-BRANCH="${BRANCH:-agent-loop}"         # branch the agent commits to
-CPUS="${CPUS:-0}"                      # 0 = auto (all host CPUs)
-MEMORY="${MEMORY:-}"                   # e.g. 8g; empty = sbx default
-
-# --- loop control ---
-MAX_ITERS="${MAX_ITERS:-10}"           # hard cap; always set one
-MAX_TURNS="${MAX_TURNS:-40}"           # agentic turns per iteration
-SLEEP_BETWEEN="${SLEEP_BETWEEN:-0}"    # seconds between iterations
-STOP_ON_NO_COMMIT="${STOP_ON_NO_COMMIT:-1}"  # bail if an iteration commits nothing
-
-# --- the task ---
-# $PROMPT_FILE is the only input. It is the prompt: its prose says how to work on
-# this repository, its checklist says what to work on, and the loop sends it to
-# the agent verbatim, every iteration. There is no separate prompt setting —
-# instructions and task list are edited, reviewed and committed together, and
-# two inputs only gave them a way to disagree.
 #
-# Because it is used verbatim, nothing in it is interpolated: it has to spell
-# out $DONE_SENTINEL itself, or the loop can never detect that the work is
-# finished. load_prompt checks that before spending anything.
-PROMPT_FILE="${PROMPT_FILE:-PROMPT.md}"
-DONE_SENTINEL="${DONE_SENTINEL:-ALL_DONE}"
-MODEL="${MODEL:-}"                     # empty = the agent profile's default (claude: opus)
-EFFORT="${EFFORT:-medium}"             # low | medium | high | xhigh | max; empty = default
+# Every setting afk has, in one list: NAME|default|what it is. This is the only
+# place a setting is declared. It is the whitelist load_repo_config validates
+# .afkrc against, the defaults apply_defaults falls back to, the template
+# `afk init` writes and the table `afk config` prints — so a setting added here
+# turns up in all four without touching them.
+#
+# Entries starting with `#|` are section headings for the generated .afkrc and
+# are skipped everywhere else.
+SETTINGS=(
+  "#|sandbox"
+  "BOX||sandbox name. One per repository — the default is this directory's name"
+  "AGENT|claude|claude or codex (see AGENT PROFILES)"
+  "USE_CLONE|1|1 = private in-VM clone, 0 = mount your working tree directly"
+  "BRANCH|afk-agent|branch the agent commits to"
+  "CPUS|0|0 = auto (all host CPUs)"
+  "MEMORY||e.g. 8g; empty = the sbx default"
+  "#|loop control"
+  "MAX_ITERATIONS|10|hard cap on iterations; always set one"
+  "MAX_TURNS|40|agentic turns per iteration (claude only)"
+  "SLEEP_BETWEEN|0|seconds between iterations"
+  "STOP_ON_NO_COMMIT|1|bail if an iteration commits nothing"
+  "#|the prompt"
+  "PROMPT_FILE|PROMPT.md|the only input to \`loop\` — it is the prompt"
+  "DONE_SENTINEL|ALL_DONE|what the agent says when the list is finished"
+  "MODEL||empty = the agent profile's default (claude: opus)"
+  "EFFORT|medium|low, medium, high, xhigh or max; empty = the agent's default"
+  "#|output"
+  "LOG_DIR|./.afk-logs|per-iteration JSON, and any bundle a failed fetch leaves"
+)
 
-# --- output ---
-LOG_DIR="${LOG_DIR:-./.afk-logs}"
+CONFIG_FILE=".afkrc"      # per-repository settings, at the repository root
+CONFIG_PATH=""            # set by load_repo_config when one was actually read
 
 # ==============================================================================
 # INTERNALS
@@ -80,18 +73,9 @@ die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
 
-# The repository afk operates on: the one containing the current directory.
-# We move to its root and stay there, so everything downstream — the directory
-# mounted into the VM, the `git fetch` that brings the branch back, LOG_DIR,
-# and PROMPT_FILE — resolves against one path with no way for them to disagree.
-#
-# Root, not the current directory: running from a subdirectory would otherwise
-# mount that subdirectory, and `sbx create --clone` needs a git root to clone.
-#
-# The path must be absolute AND correctly cased: macOS is case-insensitive but
-# the Linux VM is not, so mounting /Users/me/developer when the real directory
-# is /Users/me/Developer makes sandbox creation fail. /bin/pwd (not the bash
-# builtin, which just echoes $PWD back) calls getcwd() and returns the real one.
+# REPO = The repository afk operates on: the one containing the current directory.
+# Everything downstream — the directory mounted into the VM, the `git fetch` that
+# brings the branch back, LOG_DIR, and PROMPT_FILE — resolves against it.
 REPO=""
 resolve_repo() {
   local top
@@ -100,6 +84,129 @@ resolve_repo() {
   [[ -n "$top" ]] || die "no repository root here (a bare repo?) — cd into a working tree"
   REPO="$(cd "$top" && /bin/pwd -P)" || die "cannot enter repository root: $top"
   cd "$REPO" || die "cannot enter repository root: $REPO"
+}
+
+# ==============================================================================
+# SETTINGS RESOLUTION
+# ==============================================================================
+#
+# Three layers, highest first: the environment, $REPO/$CONFIG_FILE, the defaults
+# in SETTINGS. Where a value came from is recorded in AFK_SRC_<NAME> so `config`
+# can show it and `init` knows which lines to write out uncommented.
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+setting_names() {
+  local e
+  for e in "${SETTINGS[@]}"; do
+    [[ "$e" == '#|'* ]] && continue
+    printf '%s\n' "${e%%|*}"
+  done
+}
+
+setting_field() {  # <name> <1=default|2=comment>
+  local e rest
+  for e in "${SETTINGS[@]}"; do
+    [[ "${e%%|*}" == "$1" ]] || continue
+    rest="${e#*|}"
+    [[ "$2" == 1 ]] && { printf '%s' "${rest%%|*}"; return; }
+    printf '%s' "${rest#*|}"; return
+  done
+}
+
+# BOX is the one default that cannot be a constant: the whole point is that a
+# different repository gets a different sandbox without being told to. sbx names
+# are restrictive, so anything the directory name might contain and a name may
+# not becomes a dash.
+default_box() {
+  local name
+  name="$(basename "$REPO" | tr -c 'A-Za-z0-9._-' '-')"
+  name="$(trim "${name//$'\n'/}")"
+  while [[ "$name" == -* ]]; do name="${name#-}"; done
+  while [[ "$name" == *- ]]; do name="${name%-}"; done
+  printf '%s' "${name:-afk}"
+}
+
+setting_default() {
+  [[ "$1" == BOX ]] && { [[ -n "$REPO" ]] && default_box || printf 'afk'; return; }
+  setting_field "$1" 1
+}
+
+# Runs before anything else can touch these names, so "already set" can only
+# mean "came from the environment".
+snapshot_env() {
+  local n
+  for n in $(setting_names); do
+    if [[ -n "${!n+x}" ]]; then printf -v "AFK_SRC_$n" '%s' env
+    else                        printf -v "AFK_SRC_$n" '%s' default; fi
+  done
+}
+
+src_of() { local v="AFK_SRC_$1"; printf '%s' "${!v}"; }
+
+# .afkrc is parsed, never sourced. It arrives with the repository, and `cd`ing
+# into a repository and typing `afk loop` must not be able to run that
+# repository's shell code on your host — that is what the microVM is for. So:
+# literal KEY=value only, no expansion, no substitution, and an unknown key is
+# an error rather than a line that silently does nothing.
+load_repo_config() {
+  local path="$REPO/$CONFIG_FILE"
+  [[ -f "$path" ]] || return 0
+  CONFIG_PATH="$path"
+
+  local line n=0 key val known
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    line="$(trim "$line")"
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+    [[ "$line" == *=* ]] || die "$CONFIG_FILE:$n: not KEY=value: $line"
+
+    key="$(trim "${line%%=*}")"
+    val="$(trim "${line#*=}")"
+
+    known=""
+    for known in $(setting_names); do [[ "$known" == "$key" ]] && break; done
+    [[ "$known" == "$key" ]] \
+      || die "$CONFIG_FILE:$n: unknown setting $key — see \`$(basename "$0") config\`"
+
+    # A trailing comment is stripped only when unquoted and preceded by space,
+    # so a value that really contains a # keeps it by being quoted.
+    if [[ "$val" != '"'* && "$val" != "'"* && "$val" =~ ^(.*[^[:space:]])?[[:space:]]+#.*$ ]]; then
+      val="$(trim "${BASH_REMATCH[1]}")"
+    fi
+    if [[ ${#val} -ge 2 && ( ( "$val" == '"'*'"' ) || ( "$val" == "'"*"'" ) ) ]]; then
+      val="${val:1:${#val}-2}"
+    fi
+
+    # The environment wins, so a value set there is left alone — but the file
+    # still says what it says, and `config` reports env as the source.
+    [[ "$(src_of "$key")" == env ]] && continue
+    printf -v "$key" '%s' "$val"
+    printf -v "AFK_SRC_$key" '%s' file
+  done < "$path"
+}
+
+apply_defaults() {
+  local n
+  for n in $(setting_names); do
+    [[ -n "${!n+x}" ]] || printf -v "$n" '%s' "$(setting_default "$n")"
+  done
+}
+
+# What the file changed, on one line next to the repository it belongs to.
+report_config() {
+  [[ -n "$CONFIG_PATH" ]] || return 0
+  local n out=""
+  for n in $(setting_names); do
+    [[ "$(src_of "$n")" == file ]] && out+=" $n=${!n}"
+  done
+  log "config: $CONFIG_FILE$out"
 }
 
 box_exists() { sbx ls -q 2>/dev/null | grep -qx "$BOX"; }
@@ -120,18 +227,14 @@ ensure_box() {
   sbx create "${args[@]}" || die "sandbox creation failed"
 }
 
-# NOTE: do NOT add `-u root` here. Claude Code refuses to run with
-# --dangerously-skip-permissions as root, and you don't need root anyway.
 in_box() { sbx exec "$BOX" "$@"; }
 
 head_sha() { in_box git rev-parse HEAD 2>/dev/null | tr -d '\r\n'; }
 
-# The prompt is $PROMPT_FILE, read from inside the sandbox rather than from the
-# host: in clone mode the agent reads and rewrites the VM's committed copy, so
-# reading that same copy is what stops the prompt describing a task list the
-# agent cannot see. It also catches the common mistake — editing PROMPT.md and
-# forgetting to commit — as an empty or stale prompt at iteration 1, before any
-# money is spent.
+# The prompt used is in $PROMPT_FILE, read from inside the sandbox.
+# Thus, the $PROMPT_FILE must be a commited file prior to sandbox creation
+# load_prompt also checks for empty $PROMPT_FILE and 
+# the presence of a $DONE_SENTINEL - which should stop an agent when work is complete
 PROMPT=""
 SENTINEL_WARNED=""
 load_prompt() {
@@ -139,10 +242,9 @@ load_prompt() {
     || die "$PROMPT_FILE not found in the sandbox workspace — commit it, then \`$(basename "$0") remove\`"
   PROMPT="$(in_box cat "$PROMPT_FILE")" || die "could not read $PROMPT_FILE from the sandbox"
   [[ -n "${PROMPT//[[:space:]]/}" ]] || die "$PROMPT_FILE is empty — it is the prompt, so there is nothing to run"
-  # Re-read every iteration, so warn once rather than on every one.
   if [[ -z "$SENTINEL_WARNED" && "$PROMPT" != *"$DONE_SENTINEL"* ]]; then
     SENTINEL_WARNED=1
-    warn "$PROMPT_FILE never mentions $DONE_SENTINEL — the loop can only stop on MAX_ITERS"
+    warn "$PROMPT_FILE never mentions $DONE_SENTINEL — the loop can only stop on MAX_ITERATIONS"
   fi
 }
 
@@ -150,25 +252,25 @@ load_prompt() {
 # AGENT PROFILES
 # ==============================================================================
 #
-# Agents differ in three ways, and only these three: how to invoke them
-# headlessly, how to recover the final assistant message, and whether they
-# report a cost. Everything below this section is agent-neutral.
+# Agents differ in two ways: how to invoke them headlessly, and how to recover
+# the final assistant message. Adding a docker sandbox compatible agent requires
+# adding an agent profile below.
 #
-# Each profile defines:
+# Each agent profile defines:
 #   build_agent_flags <prompt> <max_turns>   -> sets the AGENT_FLAGS array
 #   agent_text  <raw_output>                 -> prints the final message
-#   agent_cost  <raw_output>                 -> prints a dollar amount, or 0
 #   agent_failed <raw_output>                -> true if the run errored
 
 CODEX_LAST_MSG="/tmp/afk-last-message.txt"
 
+select_agent_profile() {
 case "$AGENT" in
   claude)
     MODEL="${MODEL:-opus}"
     build_agent_flags() {
       AGENT_FLAGS=(
         -p "$1"
-        --dangerously-skip-permissions   # ok here: the microVM is the boundary
+        --dangerously-skip-permissions
         --max-turns "$2"
         --output-format json
       )
@@ -177,7 +279,6 @@ case "$AGENT" in
       return 0
     }
     agent_text()   { jq -r '.result // empty'        <<<"$1"; }
-    agent_cost()   { jq -r '.total_cost_usd // 0'    <<<"$1"; }
     agent_failed() { [[ "$(jq -r '.is_error // false' <<<"$1")" == "true" ]]; }
     ;;
 
@@ -187,9 +288,8 @@ case "$AGENT" in
     #   - --json emits a stream of JSONL events, not one result object, so the
     #     final message is recovered from --output-last-message instead.
     #   - there is no --max-turns equivalent, so $2 is ignored and MAX_TURNS
-    #     has no effect. MAX_ITERS is your only bound.
+    #     has no effect. MAX_ITERATIONS is your only bound.
     #   - reasoning effort is a config override, not a flag.
-    #   - no cost is reported, so the running total stays at 0.
     build_agent_flags() {
       AGENT_FLAGS=(
         exec
@@ -203,10 +303,6 @@ case "$AGENT" in
       return 0
     }
     agent_text()   { in_box cat "$CODEX_LAST_MSG" 2>/dev/null; }
-    agent_cost()   { printf '0'; }
-    # turn.failed, not "type":"error" — codex emits error events for transient
-    # things it then recovers from (websocket reconnects), so matching those
-    # would fail runs that actually went on to succeed.
     agent_failed() { grep -q '"type":"turn.failed"' <<<"$1"; }
     ;;
 
@@ -214,54 +310,107 @@ case "$AGENT" in
     die "no profile for AGENT=$AGENT (known: claude, codex)"
     ;;
 esac
+}
 
 # ==============================================================================
 # SUBCOMMANDS
 # ==============================================================================
 
+# Quote only when the value would not survive the parser unquoted.
+quote_value() {
+  case "$1" in
+    ""|*[!A-Za-z0-9._/@:=+-]*) printf '"%s"' "$1" ;;
+    *)                         printf '%s'   "$1" ;;
+  esac
+}
+
+# afk init - Writes .afkrc: every setting displays its default, commented out.
+#
+# `AGENT=codex afk init` freezes the setup with defined variables
+# Requires `FORCE=1 afk init` to regenerate the file if an .afkrc is already present
+cmd_init() {
+  local path="$REPO/$CONFIG_FILE" me; me="$(basename "$0")"
+  [[ -e "$path" && "${FORCE:-0}" != "1" ]] \
+    && die "$CONFIG_FILE already exists — FORCE=1 $me init to rewrite it"
+
+  local e n src out=""
+  out+="# $CONFIG_FILE — afk settings for this repository. Written by \`$me init\`."$'\n'
+  out+="#"$'\n'
+  out+="# Commit .afkrc to your git repository"$'\n'
+  out+="# .afkrc automatically selects the correct \`afk\` configuration"$'\n'
+  out+="# Environment variables still win over anything set below, and"$'\n'
+  out+="# every commented-out line is showing afk's built-in defaults."$'\n'
+  for e in "${SETTINGS[@]}"; do
+    if [[ "$e" == '#|'* ]]; then
+      out+=$'\n'"# --- ${e#\#|} ---"$'\n'
+      continue
+    fi
+    n="${e%%|*}"
+    src="$(src_of "$n")"
+    out+="# $(setting_field "$n" 2)"$'\n'
+    if [[ "$n" == BOX || "$src" != default ]]; then
+      out+="$n=$(quote_value "${!n}")"$'\n'
+    else
+      out+="# $n=$(quote_value "$(setting_default "$n")")"$'\n'
+    fi
+  done
+
+  printf '%s' "$out" > "$path" || die "could not write $path"
+  log "wrote $path"
+  log "sandbox for this repository: $BOX"
+  [[ -f "$REPO/$PROMPT_FILE" ]] \
+    || warn "no $PROMPT_FILE here yet — \`$me loop\` needs one; see the README"
+}
+
+# afk config - shows the current active afk config with source of the value
+cmd_config() {
+  local e n src
+  printf '%-18s %-24s %s\n' SETTING VALUE SOURCE
+  for e in "${SETTINGS[@]}"; do
+    [[ "$e" == '#|'* ]] && continue
+    n="${e%%|*}"
+    src="$(src_of "$n")"
+    [[ "$src" == file ]] && src="$CONFIG_FILE"
+    printf '%-18s %-24s %s\n' "$n" "${!n:-(none)}" "$src"
+  done
+  [[ -n "$CONFIG_PATH" ]] || log "no $CONFIG_FILE here — \`$(basename "$0") init\` writes one"
+}
+
+# afk smoke - test box + auth + network + model in current afk config
 cmd_smoke() {
   ensure_box
   log "workspace inside sandbox:"; in_box pwd
   log "git status:";               in_box git status --short --branch
   log "$AGENT version:";           in_box "$AGENT" --version
-  # Same profile, model and effort as the loop, so a bad --model surfaces here
-  # for one cheap turn rather than on every iteration of a long run. (Claude
-  # Code silently ignores a bad --effort, so this cannot check that.)
   log "round-trip test (checks auth + network + model):"
   build_agent_flags "Reply with exactly: PONG" 1
   local out; out=$(in_box "$AGENT" "${AGENT_FLAGS[@]}" </dev/null)
   agent_failed "$out" && { printf '%s\n' "$out" | tail -5; die "round-trip failed"; }
   printf '%s\n' "$(agent_text "$out")"
-  log "cost \$$(agent_cost "$out")"
   log "smoke test passed"
 }
 
+# afk shell - drop in sandbox shell
 cmd_shell() { ensure_box; sbx exec -it "$BOX" bash; }
 
+# afk remove - remove sandbox
 cmd_remove() {
   log "removing sandbox $BOX"
   sbx rm -f "$BOX" 2>/dev/null || true
   log "gone. next run will create it fresh."
 }
 
-# Switch to $BRANCH, creating it only if it is missing. Deliberately NOT
-# `checkout -B`, which force-resets the branch to HEAD and would silently
-# discard the commits a previous run left on it.
+# Switch to $BRANCH, creating it only if it is missing.
 use_branch() {
   in_box git checkout "$BRANCH" 2>/dev/null \
     || in_box git checkout -b "$BRANCH" \
     || die "could not switch to branch $BRANCH"
 }
 
-# One agent run on a prompt you pass in, instead of the whole $PROMPT_FILE loop.
-# Everything else is the loop's machinery: same sandbox, same branch, and the
-# same bundle fetch at the end, so whatever it commits comes back the same way.
-# For asking a question rather than changing anything, nothing is committed and
-# extract is a no-op beyond re-fetching the branch as it was.
+# afk prompt - one agent run on a prompt you pass in.
+# Changes are collected through git fetch so tell the agent to commit any work it does in the sandbox
 cmd_prompt() {
   local prompt="$*"
-  # No arguments and something piped in: take the prompt from stdin, so
-  # `afk prompt < brief.md` works without shell-quoting a multi-line file.
   if [[ -z "$prompt" && ! -t 0 ]]; then prompt="$(cat)"; fi
   [[ -n "${prompt//[[:space:]]/}" ]] \
     || die "nothing to ask — usage: $(basename "$0") prompt <text>"
@@ -280,29 +429,26 @@ cmd_prompt() {
   agent_failed "$out" && die "$AGENT reported an error — see $LOG_DIR/prompt.json"
 
   printf '%s\n' "$(agent_text "$out")"
-  log "cost \$$(agent_cost "$out")"
   in_box git log --oneline -1
   extract
 }
-
+# afk loop - Runs agent in sandbox with $PROMPT_FILE as instructions
 cmd_loop() {
   ensure_box
   mkdir -p "$LOG_DIR"
   use_branch
 
-  local total=0 i
-  for i in $(seq 1 "$MAX_ITERS"); do
-    printf '\n'; log "iteration $i / $MAX_ITERS"
+  local i
+  for i in $(seq 1 "$MAX_ITERATIONS"); do
+    printf '\n'; log "iteration $i / $MAX_ITERATIONS"
 
-    # Re-read the file each time: the agent ticks items off in it, so the
-    # previous iteration's edits are exactly what tells this fresh, empty
-    # context what is left to do.
+    # Re-read the prompt file each loop iteration
     load_prompt
+
+    # Build agent's profile flags
     build_agent_flags "$PROMPT" "$MAX_TURNS"
 
     local before; before=$(head_sha)
-    # </dev/null or codex reads the inherited stdin and appends it to the
-    # prompt; harmless for claude, which takes the prompt as an argument.
     local out; out=$(in_box "$AGENT" "${AGENT_FLAGS[@]}" </dev/null)
     local status=$?
 
@@ -313,27 +459,24 @@ cmd_loop() {
       break
     fi
 
-    # Belt and braces. API failures (bad model, 429, overloaded) do exit
-    # nonzero and are caught above, but this reports what actually went wrong
-    # instead of a bare exit code, and covers any case that exits 0 anyway.
+    # Break when agent reports an error - based on agent's profile agent_failed
     if agent_failed "$out"; then
       warn "$AGENT reported an error — see $LOG_DIR/iter-$i.json"
       break
     fi
 
-    local text cost
+    local text
     text=$(agent_text "$out")
-    cost=$(agent_cost "$out")
-    total=$(awk "BEGIN{printf \"%.4f\", $total + $cost}")
 
     printf '%s\n' "$text"
-    log "cost \$$cost  |  running total \$$total"
 
+    # Break when agent reports done sentinel
     if [[ "$text" == *"$DONE_SENTINEL"* ]]; then
       log "sentinel reached — finished after $i iterations"
       break
     fi
 
+    # Break when agent has not committed any work - probably stuck
     local after; after=$(head_sha)
     if [[ "$STOP_ON_NO_COMMIT" == "1" && "$before" == "$after" ]]; then
       warn "no commit this iteration — likely stuck; stopping"
@@ -342,19 +485,18 @@ cmd_loop() {
     fi
     in_box git log --oneline -1
 
+    # Sleep between iterations
     [[ "$SLEEP_BETWEEN" -gt 0 ]] && sleep "$SLEEP_BETWEEN"
   done
 
-  log "total spend this run: \$$total"
   extract
 }
 
-# Stream the branch out as a git bundle over `sbx exec`.
+# extract - streams the branch out as a git bundle over `sbx exec`.
 #
 # Clone mode also adds a `sandbox-<name>` git remote to the host repo, but sbx
-# deletes that remote whenever the sandbox stops and does not restore it on
-# restart, so fetching from it works only until the first stop. exec always
-# works — it starts a stopped sandbox first — and its status chatter goes to
+# deletes that remote whenever the sandbox stops after the agent stops.
+# sbx exec always works — it starts a stopped sandbox — and its status chatter goes to
 # stderr, so the bundle on stdout stays intact.
 extract() {
   [[ "$USE_CLONE" == "1" ]] || { log "not clone mode — work is already on disk"; return; }
@@ -364,12 +506,12 @@ extract() {
   in_box git bundle create - "$BRANCH" 2>/dev/null > "$bundle" \
     || { warn "could not bundle $BRANCH out of the sandbox"; return; }
 
-  # On success the commits are in the repo, so the bundle is just a duplicate.
-  # Only keep it when the fetch failed and it is the sole copy on the host.
+  # On success the commits are in the repo, so the bundle is just a duplicate and can be removed.
+  # Only keep bundle when the fetch failed and it is the sole copy on the host.
   git fetch "$bundle" "$BRANCH:$BRANCH" 2>/dev/null \
     && { rm -f "$bundle"; log "fetched. review with: git log --oneline $BRANCH"; return; }
 
-  # Almost always: $BRANCH already exists here and has diverged from the
+  # Almost always: $BRANCH already exists on host and has diverged from the
   # sandbox's copy. Never force — the sandbox's work is in the bundle either
   # way, so let the user pick a name and diff the two themselves.
   warn "could not fast-forward $BRANCH — it already exists here and has diverged"
@@ -384,32 +526,56 @@ usage() {
   cat <<EOF
 usage: $me <command>
 
+  init            write $CONFIG_FILE for this repository, so afk knows which
+                  sandbox and agent this project uses
+  config          show every effective setting and where it came from
   loop            work through $PROMPT_FILE (instructions + checklist), one item
                   per iteration, until it is done
-  prompt <text>   run the agent once on that prompt (or on stdin) instead of
-                  $PROMPT_FILE, then fetch the branch back
+  prompt <text>   run the agent once on that prompt instead of $PROMPT_FILE,
+                  then fetch the branch back. With no <text>, the prompt is read
+                  from stdin: $(basename "$0") prompt < brief.md
   smoke           verify sandbox + auth + network + model. Do this first.
   shell           drop into the sandbox to poke around
   remove          destroy the sandbox so the next run starts clean
 
-Runs against the repository you are currently in — cd there first. Settings are
-environment variables, e.g. MAX_ITERS=3 MODEL=sonnet $me loop — see the README.
+Runs against the repository you are currently in — cd there first. Settings come
+from the environment, then $CONFIG_FILE, then built-in defaults:
+MAX_ITERATIONS=3 MODEL=sonnet $me loop — see the README.
 EOF
 }
 
-# No bare default: `loop` starts a long, billable run, so it has to be asked
+# No bare default: `loop` starts a long, unattended run, so it has to be asked
 # for by name rather than being what you get for typing the command alone.
 # Help works without the dependencies installed, so it comes first.
 case "${1:-}" in
-  ""|help|-h|--help) usage; exit 0 ;;
+  ""|help|-h|--help) apply_defaults; usage; exit 0 ;;
 esac
 
-need sbx; need jq; need git; need awk
-
+# Order matters here, and this is the whole of it: find the repository before
+# reading its settings, read them before the defaults can paper over them, and
+# resolve all of it before picking the agent profile — which reads $AGENT, and
+# so cannot run at load time any more.
+need git
 resolve_repo
 log "repository: $REPO"
 
+snapshot_env
+load_repo_config
+apply_defaults
+report_config
+
 cmd="$1"; shift
+
+# Neither of these talks to a sandbox, so neither needs sbx or jq installed —
+# `init` in particular is the first thing you run in a new repository.
+case "$cmd" in
+  init)   cmd_init;   exit 0 ;;
+  config) cmd_config; exit 0 ;;
+esac
+
+need sbx; need jq
+select_agent_profile
+
 case "$cmd" in
   loop)   cmd_loop   ;;
   prompt) cmd_prompt "$@" ;;

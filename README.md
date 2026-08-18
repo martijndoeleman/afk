@@ -4,7 +4,7 @@ afk runs a coding agent headlessly, inside one long-lived
 [Docker Sandbox](https://docs.docker.com/ai/sandboxes/) — while you are
 away-from-keyboard.
 
-Each iteration is a **fresh process with an empty context window**. Continuity
+Each afk run is a **fresh process with an empty context window**. Continuity
 comes from files and git history inside the sandbox's clone, not from
 conversation history.
 
@@ -30,11 +30,11 @@ sbx diagnose                # should report all checks passing
 Docs: [install](https://docs.docker.com/ai/sandboxes/install/) ·
 [getting started](https://docs.docker.com/ai/sandboxes/get-started/)
 
-**2. Host dependencies.** `sbx`, `jq`, `git`, `awk`. The script checks on startup
+**2. Host dependencies.** `sbx`, `jq`, `git`. The script checks on startup
 and exits if any are missing.
 
-**3. Agent credentials.** The sandbox needs its own login; host credentials are
-not shared into it. Log in once — credentials persist across restarts and are
+**3. Agent credentials.** Any agent inside a sandbox needs its own login; host credentials are
+not shared into it. Log in once in the sandbox — credentials persist across restarts and are
 shared by every sandbox, including ones you create later for other repos.
 
 ```bash
@@ -42,71 +42,38 @@ sbx run --name afk        # attach interactively
 /login                    # inside the sandbox (Claude Code), then: exit
 ```
 
-**4. A prompt file.** Create `PROMPT.md` in the repo you want worked on. This is
-afk's only input, and it **is** the prompt — sent to the agent verbatim every
-iteration. It says both how to work and what to work on:
+**4. A prompt file.** Create `PROMPT.md` in the repo you want to work on. This is
+afk's input for loops, and it is sent to the agent on every
+iteration. It should say how to work, list what to work on, tell the agent how to mark things as done, 
+and define criteria for when there is no work left to do (together with the done sentinel read by afk).
+See [PROMPT.md](/PROMPT.md) for an example. NB: Commit this file to git prior to running `afk loop` so it gets cloned into the sandbox.
 
-```markdown
-# Tasks
+**5. Settings for a specific repository (Optional).** `afk init` creates a default `.afkrc` file when not present — 
+This allows you to save different configurations (agent, sanbox name, model, etc.) between repositories.
+It is recommended to commit `.afkrc` to git so `afk` configuration can be tracked and shared:
 
-Do exactly ONE unchecked item below, then stop. Take them in order.
-Run `npm test`, then mark the item [x] and commit it with the work.
-If every item is already [x], reply with exactly: ALL_DONE
-
-- [ ] Add a --dry-run flag to the importer.
-- [ ] Backfill tests for the date parser.
+```bash
+afk init      # writes .afkrc, then commit it
 ```
 
-The `PROMPT.md` in this repo is a fuller example to copy and adapt. Because the
-file is used verbatim, it has to spell out `ALL_DONE` itself, or the loop
-can only ever stop on `MAX_ITERS` — afk warns you if it doesn't. Keep each item
-small enough for a fresh context window to finish in a few turns, and **commit
-the file** — in clone mode the sandbox clones your committed checked-out ref, so
-uncommitted changes are invisible to the agent.
-
-afk re-reads the file from inside the sandbox before every iteration, so the
-`[x]` marks the last iteration committed are what tell the next one what is
-left.
+See [Repository settings](#repository-settings).
 
 ---
 
 ## Usage
 
 ```bash
-afk smoke            # verify sandbox + auth + network + model. Do this first.
-afk loop             # run the loop
+afk init             # write .afkrc for this repo (do this once, per repo)
+afk config           # show every effective setting and where it came from
+afk smoke            # verify sandbox + auth + network + model. Do before first run.
+afk loop             # run agent in loop with instructions from PROMPT_FILE
 afk prompt "<text>"  # run the agent once on an ad-hoc prompt
-afk shell            # drop into the sandbox to poke around
-afk remove           # destroy the sandbox, start clean
+afk shell            # drop into the sandbox shell
+afk remove           # destroy the sandbox
 afk                  # print the command list (no default subcommand)
 ```
 
 Without installing, `./afk.sh loop` and friends do the same thing.
-
-When the loop finishes it fetches the agent's branch back to your repo:
-
-```bash
-git log --oneline agent-loop
-git diff main..agent-loop
-```
-
-### One-off prompts
-
-`afk prompt` runs the agent **once**, on a prompt you pass in, instead of looping
-over `PROMPT_FILE`. Same sandbox, same `$BRANCH`, same bundle fetch at the end, so
-anything it commits comes back exactly as loop's work does:
-
-```bash
-afk prompt "Add a --dry-run flag to the importer and commit it."
-afk prompt < brief.md          # multi-line prompt from a file or a pipe
-MAX_TURNS=10 afk prompt "Summarise how the auth middleware works."
-```
-
-`PROMPT_FILE` and `DONE_SENTINEL` are not used, so nothing needs to be committed
-first and no sentinel is required. Use it to try a task before writing it into
-`PROMPT.md`, to ask a question about the code, or to clean up after a loop that
-stopped early. The raw agent output lands in `.afk-logs/prompt.json`, overwritten
-each run.
 
 ### Install it as a command
 
@@ -133,38 +100,72 @@ elsewhere, so `cd` to the target repo:
 
 ```bash
 cd ~/code/my-project
-BOX=my-project afk smoke
-BOX=my-project afk loop
+afk init            # once — pins the sandbox name and agent for this repo in .afkrc
+afk smoke           # test whether sandbox + agent + model + network works
+afk loop            # loop with PROMPT_FILE as input
+afk prompt <text>   # send ad-hoc prompt to agent
 ```
 
-Any subdirectory will do; afk resolves the repository root, prints it on every
-run, and refuses to start outside a git repository. That single path is what gets
-mounted in the VM, what the branch is fetched back into, and where `.afk-logs/`
-is written.
+### Repository settings
 
-The one thing to get right is **a distinct `BOX` per repo**. Sandboxes are looked
-up by name only, so a second project reusing the default `afk` silently attaches
-to the *first* project's sandbox — same clone, same old task list — and your new
-repo is never mounted.
+`afk init` writes `.afkrc` at the repository root — every setting at its default,
+commented out, so the file is its own documentation. Two kinds of line come out
+uncommented: `BOX`, set to this directory's name, and anything you set in the
+environment for that invocation. So the way to pin a setup is to try it by hand
+and then freeze it:
 
-Each target repo needs its own committed `PROMPT.md` (or set `PROMPT_FILE`). Agent
-credentials carry over to every sandbox.
+```bash
+AGENT=codex EFFORT=high afk init
+```
+
+```sh
+# .afkrc — afk settings for this repository. Written by `afk init`.
+BOX=my-project
+AGENT=codex
+EFFORT=high
+# BRANCH=afk-agent
+# MAX_ITERATIONS=10
+```
+
+The thing that must differ per repository is **`BOX`**: sandboxes are looked up by name
+only, so two projects sharing one name means the second silently attaches to the
+*first* project's sandbox — same clone, same old prompt file — and your new repo
+is never mounted. `BOX` therefore defaults to the repository's directory name.
+ `afk init` writes that name into `.afkrc` where you can see and change it.
+
+Commit `.afkrc` to git. It is what makes `cd ~/code/my-project && afk loop` use the right
+sandbox and the right agent without being explicitly told. `afk init` refuses to overwrite
+an existing file; `FORCE=1 afk init` regenerates it, keeping whatever it already
+set.
+
+`.afkrc` is **parsed, not sourced** — literal `KEY=value` lines, no expansion, no
+substitution, and an unknown key is an error rather than a line that quietly does
+nothing. Running `afk` in a repository must not be a way for that repository to
+run shell code on your host; that is what the sandbox is for. Blank lines and
+`#` comments are ignored, a trailing `# comment` after a value is stripped, and
+quoting a value keeps any `#` inside it.
 
 ### Configuration
 
-Every setting is an environment variable:
+Settings come from three places, in order: **the environment**, then
+**`.afkrc`**, then the built-in defaults. So a `.afkrc` pins the project and an
+environment variable still overrides it for one run:
 
 ```bash
-MAX_ITERS=3 MODEL=sonnet afk loop
+MAX_ITERATIONS=3 MODEL=sonnet afk loop
 ```
+
+`afk config` prints the resolved value of every setting and which of the three it
+came from — the answer to "why did it use *that* sandbox?". It touches no
+sandbox.
 
 | Variable | Default | Notes |
 |---|---|---|
 | `AGENT` | `claude` | `claude` or `codex` |
-| `BOX` | `afk` | Sandbox name; **one per project** |
+| `BOX` | repo directory name | Sandbox name; **one per project** |
 | `USE_CLONE` | `1` | `1` = private in-VM clone, `0` = mount your tree directly |
-| `BRANCH` | `agent-loop` | Branch the agent commits to |
-| `MAX_ITERS` | `10` | Hard cap. Always set one |
+| `BRANCH` | `afk-agent` | Branch the agent commits to |
+| `MAX_ITERATIONS` | `10` | Hard cap. Always set one |
 | `MAX_TURNS` | `40` | Agentic turns per iteration (Claude Code only) |
 | `STOP_ON_NO_COMMIT` | `1` | Bail if an iteration commits nothing |
 | `PROMPT_FILE` | `PROMPT.md` | The only input — it *is* the prompt |
@@ -172,11 +173,65 @@ MAX_ITERS=3 MODEL=sonnet afk loop
 | `MODEL` | agent default | Claude Code defaults to `opus` |
 | `EFFORT` | `medium` | `low`/`medium`/`high`/`xhigh`/`max` |
 | `LOG_DIR` | `./.afk-logs` | Per-iteration JSON |
+| `SLEEP_BETWEEN` | `0` | Seconds between iterations |
 | `CPUS` / `MEMORY` | auto | e.g. `MEMORY=8g` |
 
-There is no prompt setting. Everything you would put in one — how to test, what
-to commit, when to stop — goes in `PROMPT_FILE`, next to the items it applies to.
-For a prompt that is not worth a file of its own, use `afk prompt`.
+Every one of them can also go in `.afkrc`, and `afk init` lists them all.
+
+---
+
+## Run Invocation
+
+Two ways to put the agent to work. Both run in the same sandbox, on the same
+`$BRANCH`, and return their work the same way.
+
+### Loop — `afk loop`
+
+Unattended, many iterations. `PROMPT_FILE` (`PROMPT.md`) is sent as
+prompt every iteration, each one a fresh process with an empty context. 
+It fully relies on the `PROMPT_FILE` for instructions, done criteria,
+and stops on the `ALL_DONE` sentinel, on an iteration that commits nothing,
+or on `MAX_ITERATIONS`. Per-iteration output lands in `.afk-logs/iter-N.json`.
+
+```bash
+afk loop
+MAX_ITERATIONS=3 afk loop
+```
+
+### Ad-hoc prompt — `afk prompt`
+
+One run, one prompt:
+
+```bash
+afk prompt "Add a --dry-run flag to the importer and commit it."
+afk prompt < brief.md          # a markdown file, or anything piped in
+```
+Output lands in `.afk-logs/prompt.json`. 
+
+**Remember:** always instruct an agent to commit its work on the local branch (inside the sandbox) so work can be easily retrieved by the default extraction method.
+
+### Getting the work back
+
+In clone mode (the default) the agent commits to a clone **inside** the VM, and
+your working tree is never touched. At the end of a `loop` or a `prompt`, afk
+streams `$BRANCH` out as a git bundle over `sbx exec` and fetches it into your
+repo.
+
+If your local `$BRANCH` has diverged, the fetch is refused rather than forced, 
+the bundle is kept in `.afk-logs/` and afk prints the command to fetch it under
+another name. Nothing is ever overwritten.
+
+### Take a look inside — `afk shell`
+
+```bash
+afk shell
+```
+
+An interactive bash session in the sandbox, starting the box if it is stopped.
+This is where you go when a run ends badly: read the agent's branch and diffs,
+run the tests it could not get passing, or check that `PROMPT.md` says what you
+think it says. Nothing you do here reaches your working tree; `exit` leaves the
+sandbox running, `afk remove` destroys it.
 
 ---
 
@@ -257,8 +312,7 @@ AGENT=codex sbx run --name afk    # then, inside: codex login
 This builds a codex sandbox rather than a Claude Code one, so it needs its own
 login. It also differs in ways that change what you get:
 
-- **No cost reporting.** The running total stays at `$0`.
-- **`MAX_TURNS` has no effect** — no `--max-turns` equivalent, so `MAX_ITERS` is
+- **`MAX_TURNS` has no effect** — no `--max-turns` equivalent, so `MAX_ITERATIONS` is
   your only bound on a runaway iteration. Set it low at first.
 - **`EFFORT` is a config override** (`-c model_reasoning_effort=...`), not a flag.
 - **`MODEL` has no default.** An unrecognised name degrades quietly rather than
@@ -267,50 +321,14 @@ login. It also differs in ways that change what you get:
 ### Adding another agent
 
 `sbx` also ships copilot, cursor, droid, gemini, kiro and opencode templates. To
-add one, write a profile in the `AGENT PROFILES` block — four functions:
+add one, write a profile in the `AGENT PROFILES` block — three functions:
 
 ```
 build_agent_flags <prompt> <max_turns>   -> sets the AGENT_FLAGS array
 agent_text  <raw_output>                 -> prints the final message
-agent_cost  <raw_output>                 -> prints a dollar amount, or 0
 agent_failed <raw_output>                -> true if the run errored
 ```
 
 Everything outside that block is agent-neutral. The easiest way to write one is
 to run the agent once by hand inside a sandbox and look at its actual output —
 the event schemas are not reliably documented.
-
----
-
-## How work gets back to you
-
-In clone mode (the default) the agent commits to a clone **inside** the VM. The
-loop streams that branch out as a git bundle over `sbx exec` and fetches it into
-your repo. If your local `$BRANCH` has diverged, the fetch is refused rather than
-forced: the bundle is kept in `.afk-logs/` and the loop prints the command to
-fetch it under another name so you can diff the two. Nothing is ever overwritten.
-
-Clone mode also adds a `sandbox-<name>` git remote, but **don't rely on it** —
-sbx deletes it when the sandbox stops and does not restore it. The bundle path
-works either way.
-
-## Gotchas
-
-- **The sandbox is persistent.** Re-running the loop reuses the same clone, so
-  the agent finds the previous run's work already done and immediately reports
-  `ALL_DONE`. Use `afk remove` for a clean run.
-- **Commit `PROMPT.md` before running.** The clone only sees committed state.
-- **The network policy is global, not per-repo.** See
-  [Network policy](#network-policy).
-- **The repo you are standing in is the repo that gets worked on.** `cd` first;
-  afk prints the repository it resolved before doing anything.
-- **Cost is front-loaded per iteration.** A fresh process re-reads the whole
-  system prompt every time. Back-to-back iterations hit the 1-hour prompt cache
-  and cost roughly a third of a cold start, so a loop with long gaps between
-  iterations is significantly more expensive than one running straight through.
-- **Idle iterations still cost money.** The final `ALL_DONE` iteration pays full
-  overhead to say two words.
-- **Workspace paths are case-sensitive inside the VM.** macOS is not, so
-  `/Users/me/developer/x` works on the host and fails in the VM with an unhelpful
-  `failed to run sandbox container`. afk resolves the real casing with
-  `/bin/pwd -P`, so this only bites if you invoke `sbx` yourself.
