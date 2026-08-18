@@ -168,13 +168,13 @@ sandbox.
 | `MAX_ITERATIONS` | `10` | Hard cap. Always set one |
 | `MAX_TURNS` | `40` | Agentic turns per iteration (Claude Code only) |
 | `STOP_ON_NO_COMMIT` | `1` | Bail if an iteration commits nothing |
-| `PROMPT_FILE` | `PROMPT.md` | The only input — it *is* the prompt |
-| `DONE_SENTINEL` | `ALL_DONE` | What the agent says when the list is finished |
+| `PROMPT_FILE` | `PROMPT.md` | The prompt file to use in `afk loop` |
+| `DONE_SENTINEL` | `ALL_DONE` | What the agent says when the work is finished |
 | `MODEL` | agent default | Claude Code defaults to `opus` |
 | `EFFORT` | `medium` | `low`/`medium`/`high`/`xhigh`/`max` |
 | `LOG_DIR` | `./.afk-logs` | Per-iteration JSON |
 | `SLEEP_BETWEEN` | `0` | Seconds between iterations |
-| `CPUS` / `MEMORY` | auto | e.g. `MEMORY=8g` |
+| `CPUS` / `MEMORY` | auto | e.g. `MEMORY=8g`, `CPUS=2` |
 
 Every one of them can also go in `.afkrc`, and `afk init` lists them all.
 
