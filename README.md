@@ -133,6 +133,10 @@ only, so two projects sharing one name means the second silently attaches to the
 is never mounted. `BOX` therefore defaults to the repository's directory name.
  `afk init` writes that name into `.afkrc` where you can see and change it.
 
+`afk init` also appends `LOG_DIR` to the repository's `.gitignore` — iteration
+logs are noise, not history. It is skipped when git already ignores the directory,
+when the entry is already there, or when `LOG_DIR` points outside the repository.
+
 Commit `.afkrc` to git. It is what makes `cd ~/code/my-project && afk loop` use the right
 sandbox and the right agent without being explicitly told. `afk init` refuses to overwrite
 an existing file; `FORCE=1 afk init` regenerates it, keeping whatever it already

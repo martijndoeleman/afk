@@ -329,6 +329,27 @@ quote_value() {
   esac
 }
 
+# Keeps LOG_DIR out of git: `init` appends it to $REPO/.gitignore. A LOG_DIR
+# outside the repository, or one git already ignores, is left alone.
+ignore_log_dir() {
+  local dir="$LOG_DIR" entry
+
+  [[ "$dir" == /* ]] && return 0            # absolute — not ours to ignore
+  dir="${dir#./}"; dir="${dir%/}"
+  [[ -n "$dir" && "$dir" != "." && "$dir" != ..* ]] || return 0
+
+  entry="/$dir/"
+  git -C "$REPO" check-ignore -q "$dir" 2>/dev/null && return 0
+  grep -qxF "$entry" "$REPO/.gitignore" 2>/dev/null && return 0
+
+  # A file without a trailing newline would swallow the entry onto its last line.
+  [[ -s "$REPO/.gitignore" && -n "$(tail -c 1 "$REPO/.gitignore")" ]] \
+    && printf '\n' >> "$REPO/.gitignore"
+  printf '%s\n' "$entry" >> "$REPO/.gitignore" \
+    || { warn "could not write $REPO/.gitignore — add $entry yourself"; return 0; }
+  log "added $entry to .gitignore"
+}
+
 # afk init - Writes .afkrc: every setting displays its default, commented out.
 #
 # `AGENT=codex afk init` freezes the setup with defined variables
@@ -362,6 +383,7 @@ cmd_init() {
 
   printf '%s' "$out" > "$path" || die "could not write $path"
   log "wrote $path"
+  ignore_log_dir
   log "sandbox for this repository: $BOX"
   [[ -f "$REPO/$PROMPT_FILE" ]] \
     || warn "no $PROMPT_FILE here yet — \`$me loop\` needs one; see the README"
@@ -532,7 +554,7 @@ usage() {
 usage: $me <command>
 
   init            write $CONFIG_FILE for this repository, so afk knows which
-                  sandbox and agent this project uses
+                  sandbox and agent this project uses, and git-ignore \$LOG_DIR
   config          show every effective setting and where it came from
   loop            work through $PROMPT_FILE (instructions + checklist), one item
                   per iteration, until it is done
