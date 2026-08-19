@@ -21,7 +21,7 @@ BOX=afk
 # --- loop control ---
 # hard cap on iterations; always set one
 # MAX_ITERATIONS=10
-# agentic turns per iteration (claude only)
+# agentic turns per iteration; 0 or -1 = unlimited (claude only)
 # MAX_TURNS=40
 # seconds between iterations
 # SLEEP_BETWEEN=0

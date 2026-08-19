@@ -166,7 +166,7 @@ sandbox.
 | `USE_CLONE` | `1` | `1` = private in-VM clone, `0` = mount your tree directly |
 | `BRANCH` | `afk-agent` | Branch the agent commits to |
 | `MAX_ITERATIONS` | `10` | Hard cap. Always set one |
-| `MAX_TURNS` | `40` | Agentic turns per iteration (Claude Code only) |
+| `MAX_TURNS` | `40` | Agentic turns per iteration; `0` or `-1` = unlimited (Claude Code only) |
 | `STOP_ON_NO_COMMIT` | `1` | Bail if an iteration commits nothing |
 | `PROMPT_FILE` | `PROMPT.md` | The prompt file to use in `afk loop` |
 | `DONE_SENTINEL` | `ALL_DONE` | What the agent says when the work is finished |

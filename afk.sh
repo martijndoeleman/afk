@@ -48,7 +48,7 @@ SETTINGS=(
   "MEMORY||e.g. 8g; empty = the sbx default"
   "#|loop control"
   "MAX_ITERATIONS|10|hard cap on iterations; always set one"
-  "MAX_TURNS|40|agentic turns per iteration (claude only)"
+  "MAX_TURNS|40|agentic turns per iteration; 0 or -1 = unlimited (claude only)"
   "SLEEP_BETWEEN|0|seconds between iterations"
   "STOP_ON_NO_COMMIT|1|bail if an iteration commits nothing"
   "#|the prompt"
@@ -271,9 +271,14 @@ case "$AGENT" in
       AGENT_FLAGS=(
         -p "$1"
         --dangerously-skip-permissions
-        --max-turns "$2"
         --output-format json
       )
+      # 0, -1 or empty means "no turn limit" — let the agent run until it is
+      # done, bounded only by MAX_ITERATIONS.
+      case "$2" in
+        ""|0|-1) ;;
+        *) AGENT_FLAGS+=(--max-turns "$2") ;;
+      esac
       [[ -n "$MODEL" ]]  && AGENT_FLAGS+=(--model "$MODEL")
       [[ -n "$EFFORT" ]] && AGENT_FLAGS+=(--effort "$EFFORT")
       return 0
