@@ -235,10 +235,7 @@ ensure_box() {
 in_box() { sbx exec "$BOX" "$@"; }
 
 # Every agent invocation goes through here, so the bound is in one place.
-# `timeout` runs inside the sandbox so that it kills the agent itself: timing
-# out the host's `sbx exec` would only detach from an agent that carries on
-# working, and burning credits, in the VM. It exits 124, which both callers
-# already treat as a failed run.
+# `timeout` runs inside the sandbox so that it kills the agent itself.
 run_agent() {
   local status
   if [[ "$TIMEOUT" -gt 0 ]]; then
@@ -582,13 +579,11 @@ extract() {
   in_box git bundle create - "$BRANCH" 2>/dev/null > "$bundle" \
     || { warn "could not bundle $BRANCH out of the sandbox"; return; }
 
-  # On success the commits are in the repo, so the bundle is just a duplicate and can be removed.
   # Only keep bundle when the fetch failed and it is the sole copy on the host.
   git fetch "$bundle" "$BRANCH:$BRANCH" 2>/dev/null \
     && { rm -f "$bundle"; log "fetched. review with: git log --oneline $BRANCH"; return; }
 
-  # Almost always: $BRANCH already exists on host and has diverged from the
-  # sandbox's copy. Never force — the sandbox's work is in the bundle either
+  # Never force merge back on the host — the sandbox's work is in the bundle either
   # way, so let the user pick a name and diff the two themselves.
   warn "could not fast-forward $BRANCH — it already exists here and has diverged"
   warn "the sandbox's work is safe in $bundle; get it with:"
