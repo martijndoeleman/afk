@@ -7,7 +7,7 @@
 # --- sandbox ---
 # sandbox name. One per repository — the default is this directory's name
 BOX=afk
-# claude or codex (see AGENT PROFILES)
+# claude, codex or copilot (see AGENT PROFILES)
 # AGENT=claude
 # 1 = private in-VM clone, 0 = mount your working tree directly
 # USE_CLONE=1
@@ -21,8 +21,8 @@ BOX=afk
 # --- loop control ---
 # hard cap on iterations; always set one
 # MAX_ITERATIONS=10
-# agentic turns per iteration; 0 or -1 = unlimited (claude only)
-# MAX_TURNS=40
+# seconds an iteration may run before the agent is killed; 0 = no limit
+# TIMEOUT=3600
 # seconds between iterations
 # SLEEP_BETWEEN=0
 # bail if an iteration commits nothing

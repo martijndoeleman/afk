@@ -41,14 +41,14 @@ set -uo pipefail
 SETTINGS=(
   "#|sandbox"
   "BOX||sandbox name. One per repository — the default is this directory's name"
-  "AGENT|claude|claude or codex (see AGENT PROFILES)"
+  "AGENT|claude|claude, codex or copilot (see AGENT PROFILES)"
   "USE_CLONE|1|1 = private in-VM clone, 0 = mount your working tree directly"
   "BRANCH|afk-agent|branch the agent commits to"
   "CPUS|0|0 = auto (all host CPUs)"
   "MEMORY||e.g. 8g; empty = the sbx default"
   "#|loop control"
   "MAX_ITERATIONS|10|hard cap on iterations; always set one"
-  "MAX_TURNS|40|agentic turns per iteration; 0 or -1 = unlimited (claude only)"
+  "TIMEOUT|3600|seconds an iteration may run before the agent is killed; 0 = no limit"
   "SLEEP_BETWEEN|0|seconds between iterations"
   "STOP_ON_NO_COMMIT|1|bail if an iteration commits nothing"
   "#|the prompt"
@@ -172,8 +172,13 @@ load_repo_config() {
 
     known=""
     for known in $(setting_names); do [[ "$known" == "$key" ]] && break; done
-    [[ "$known" == "$key" ]] \
-      || die "$CONFIG_FILE:$n: unknown setting $key — see \`$(basename "$0") config\`"
+    if [[ "$known" != "$key" ]]; then
+      # MAX_TURNS bounded turns, and only for claude. TIMEOUT bounds wall clock
+      # for every agent, and is the one that can end a run that has hung.
+      [[ "$key" == MAX_TURNS ]] \
+        && die "$CONFIG_FILE:$n: MAX_TURNS was removed — use TIMEOUT (seconds per iteration)"
+      die "$CONFIG_FILE:$n: unknown setting $key — see \`$(basename "$0") config\`"
+    fi
 
     # A trailing comment is stripped only when unquoted and preceded by space,
     # so a value that really contains a # keeps it by being quoted.
@@ -229,6 +234,23 @@ ensure_box() {
 
 in_box() { sbx exec "$BOX" "$@"; }
 
+# Every agent invocation goes through here, so the bound is in one place.
+# `timeout` runs inside the sandbox so that it kills the agent itself: timing
+# out the host's `sbx exec` would only detach from an agent that carries on
+# working, and burning credits, in the VM. It exits 124, which both callers
+# already treat as a failed run.
+run_agent() {
+  local status
+  if [[ "$TIMEOUT" -gt 0 ]]; then
+    in_box timeout "$TIMEOUT" "$AGENT" "${AGENT_FLAGS[@]}" </dev/null
+  else
+    in_box "$AGENT" "${AGENT_FLAGS[@]}" </dev/null
+  fi
+  status=$?
+  [[ $status -eq 124 ]] && warn "$AGENT hit TIMEOUT (${TIMEOUT}s) and was killed"
+  return $status
+}
+
 head_sha() { in_box git rev-parse HEAD 2>/dev/null | tr -d '\r\n'; }
 
 # The prompt used is in $PROMPT_FILE, read from inside the sandbox.
@@ -257,7 +279,7 @@ load_prompt() {
 # adding an agent profile below.
 #
 # Each agent profile defines:
-#   build_agent_flags <prompt> <max_turns>   -> sets the AGENT_FLAGS array
+#   build_agent_flags <prompt>               -> sets the AGENT_FLAGS array
 #   agent_text  <raw_output>                 -> prints the final message
 #   agent_failed <raw_output>                -> true if the run errored
 
@@ -273,12 +295,6 @@ case "$AGENT" in
         --dangerously-skip-permissions
         --output-format json
       )
-      # 0, -1 or empty means "no turn limit" — let the agent run until it is
-      # done, bounded only by MAX_ITERATIONS.
-      case "$2" in
-        ""|0|-1) ;;
-        *) AGENT_FLAGS+=(--max-turns "$2") ;;
-      esac
       [[ -n "$MODEL" ]]  && AGENT_FLAGS+=(--model "$MODEL")
       [[ -n "$EFFORT" ]] && AGENT_FLAGS+=(--effort "$EFFORT")
       return 0
@@ -292,8 +308,6 @@ case "$AGENT" in
     # differently from Claude Code:
     #   - --json emits a stream of JSONL events, not one result object, so the
     #     final message is recovered from --output-last-message instead.
-    #   - there is no --max-turns equivalent, so $2 is ignored and MAX_TURNS
-    #     has no effect. MAX_ITERATIONS is your only bound.
     #   - reasoning effort is a config override, not a flag.
     build_agent_flags() {
       AGENT_FLAGS=(
@@ -311,8 +325,43 @@ case "$AGENT" in
     agent_failed() { grep -q '"type":"turn.failed"' <<<"$1"; }
     ;;
 
+  copilot)
+    # GitHub Copilot CLI. `-p` is its non-interactive entry point; it exits 0 on
+    # success and 1 on error, and in JSON mode writes nothing to stderr.
+    #   - --allow-all is --allow-all-tools + --allow-all-paths + --allow-all-urls,
+    #     the same as the --yolo the sbx template starts copilot with. The VM is
+    #     the boundary. --allow-all-tools alone is required in prompt mode.
+    #   - --no-ask-user disables the ask_user tool, so an unattended run cannot
+    #     block on a question nobody is there to answer.
+    #   - --output-format json is JSONL: one event per line, ending in a single
+    #     {"type":"result","exitCode":N,...}. The reply is the last
+    #     assistant.message; a session.error turns up as its own event.
+    # Auth is a GitHub token with Copilot access, given to the sandbox with
+    #   sbx secret set github --command 'gh auth token'
+    build_agent_flags() {
+      AGENT_FLAGS=(
+        --allow-all
+        --no-ask-user
+        --log-level none
+        --output-format json
+      )
+      [[ -n "$MODEL" ]]  && AGENT_FLAGS+=(--model "$MODEL")
+      [[ -n "$EFFORT" ]] && AGENT_FLAGS+=(--effort "$EFFORT")
+      AGENT_FLAGS+=(-p "$1")
+      return 0
+    }
+    agent_text() {
+      jq -rs '[.[] | select(.type == "assistant.message")] | last | .data.content // empty' <<<"$1"
+    }
+    # No result line means the run died before it could write one, so treat a
+    # missing exitCode as a failure rather than a pass.
+    agent_failed() {
+      [[ "$(jq -rs 'map(select(.type == "result")) | last | .exitCode // 1' <<<"$1")" != "0" ]]
+    }
+    ;;
+
   *)
-    die "no profile for AGENT=$AGENT (known: claude, codex)"
+    die "no profile for AGENT=$AGENT (known: claude, codex, copilot)"
     ;;
 esac
 }
@@ -410,8 +459,8 @@ cmd_smoke() {
   log "git status:";               in_box git status --short --branch
   log "$AGENT version:";           in_box "$AGENT" --version
   log "round-trip test (checks auth + network + model):"
-  build_agent_flags "Reply with exactly: PONG" 1
-  local out; out=$(in_box "$AGENT" "${AGENT_FLAGS[@]}" </dev/null)
+  build_agent_flags "Reply with exactly: PONG"
+  local out; out=$(run_agent)
   agent_failed "$out" && { printf '%s\n' "$out" | tail -5; die "round-trip failed"; }
   printf '%s\n' "$(agent_text "$out")"
   log "smoke test passed"
@@ -446,8 +495,8 @@ cmd_prompt() {
   mkdir -p "$LOG_DIR"
   use_branch
 
-  build_agent_flags "$prompt" "$MAX_TURNS"
-  local out; out=$(in_box "$AGENT" "${AGENT_FLAGS[@]}" </dev/null)
+  build_agent_flags "$prompt"
+  local out; out=$(run_agent)
   local status=$?
 
   printf '%s\n' "$out" > "$LOG_DIR/prompt.json"
@@ -473,10 +522,10 @@ cmd_loop() {
     load_prompt
 
     # Build agent's profile flags
-    build_agent_flags "$PROMPT" "$MAX_TURNS"
+    build_agent_flags "$PROMPT"
 
     local before; before=$(head_sha)
-    local out; out=$(in_box "$AGENT" "${AGENT_FLAGS[@]}" </dev/null)
+    local out; out=$(run_agent)
     local status=$?
 
     printf '%s\n' "$out" > "$LOG_DIR/iter-$i.json"

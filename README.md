@@ -165,12 +165,12 @@ sandbox.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `AGENT` | `claude` | `claude` or `codex` |
+| `AGENT` | `claude` | `claude`, `codex` or `copilot` |
 | `BOX` | repo directory name | Sandbox name; **one per project** |
 | `USE_CLONE` | `1` | `1` = private in-VM clone, `0` = mount your tree directly |
 | `BRANCH` | `afk-agent` | Branch the agent commits to |
 | `MAX_ITERATIONS` | `10` | Hard cap. Always set one |
-| `MAX_TURNS` | `40` | Agentic turns per iteration; `0` or `-1` = unlimited (Claude Code only) |
+| `TIMEOUT` | `3600` | Seconds an iteration may run before the agent is killed; `0` = no limit |
 | `STOP_ON_NO_COMMIT` | `1` | Bail if an iteration commits nothing |
 | `PROMPT_FILE` | `PROMPT.md` | The prompt file to use in `afk loop` |
 | `DONE_SENTINEL` | `ALL_DONE` | What the agent says when the work is finished |
@@ -196,6 +196,10 @@ prompt every iteration, each one a fresh process with an empty context.
 It fully relies on the `PROMPT_FILE` for instructions, done criteria,
 and stops on the `ALL_DONE` sentinel, on an iteration that commits nothing,
 or on `MAX_ITERATIONS`. Per-iteration output lands in `.afk-logs/iter-N.json`.
+
+Those three only get their say once an iteration returns, so an agent that hangs
+would otherwise stall the run forever. `TIMEOUT` (one hour by default) is the
+backstop: it kills the agent inside the sandbox and ends the loop.
 
 ```bash
 afk loop
@@ -316,19 +320,41 @@ AGENT=codex sbx run --name afk    # then, inside: codex login
 This builds a codex sandbox rather than a Claude Code one, so it needs its own
 login. It also differs in ways that change what you get:
 
-- **`MAX_TURNS` has no effect** — no `--max-turns` equivalent, so `MAX_ITERATIONS` is
-  your only bound on a runaway iteration. Set it low at first.
 - **`EFFORT` is a config override** (`-c model_reasoning_effort=...`), not a flag.
 - **`MODEL` has no default.** An unrecognised name degrades quietly rather than
   erroring, so check `codex --help` for valid names.
 
+---
+
+## Using copilot instead of Claude Code
+
+```bash
+sbx secret set github --command 'gh auth token'   # a token with Copilot access
+AGENT=copilot afk smoke
+```
+
+GitHub Copilot CLI authenticates with a GitHub token rather than an interactive
+login, so the secret above is all the setup it needs. It differs in ways that
+change what you get:
+
+- **`EFFORT` maps to `--effort`** and accepts every value afk does
+  (`low`/`medium`/`high`/`xhigh`/`max`).
+- **`MODEL` has no afk default**, so copilot picks its own. `auto` lets it choose
+  per request.
+- **Tools run with `--allow-all`** (the same as `--yolo`) — the flag the sbx template already
+  starts copilot with. The VM is the boundary.
+- **`--no-ask-user` is always passed**, so an unattended iteration cannot block
+  on a question nobody is there to answer.
+- Logs are copilot's JSONL (`--output-format json`), one event per line ending
+  in a `result` event — that is where `afk` reads the reply and the exit code.
+
 ### Adding another agent
 
-`sbx` also ships copilot, cursor, droid, gemini, kiro and opencode templates. To
+`sbx` also ships cursor, droid, gemini, kiro and opencode templates. To
 add one, write a profile in the `AGENT PROFILES` block — three functions:
 
 ```
-build_agent_flags <prompt> <max_turns>   -> sets the AGENT_FLAGS array
+build_agent_flags <prompt>               -> sets the AGENT_FLAGS array
 agent_text  <raw_output>                 -> prints the final message
 agent_failed <raw_output>                -> true if the run errored
 ```
