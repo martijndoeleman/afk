@@ -1,5 +1,4 @@
 # Tasks
-
 This file is the prompt. It is sent to you verbatim at the start of every
 iteration, in a fresh session with no memory of the previous one. Everything you
 need to know is here or in the repository.

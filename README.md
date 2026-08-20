@@ -13,6 +13,27 @@ with permission prompts disabled — the VM is the safety boundary, not the agen
 judgement. Your working tree is never touched; work comes back as a branch you
 review before merging.
 
+## What it looks like
+
+<p align="center">
+  <img src="demo/afk.gif" width="900"
+       alt="A terminal session: afk init writes .afkrc, afk config lists every
+            setting and its source, afk prompt runs the agent once, and afk loop
+            works through PROMPT.md one item per iteration until the agent
+            reports the done sentinel.">
+</p>
+
+`afk init` freezes this repository's settings into `.afkrc` — here
+`MAX_ITERATIONS` comes from the environment, so that is the one line written
+uncommented. `afk config` then shows every effective setting and where it came
+from. `afk prompt` is a single ad-hoc run. `afk loop` works through `PROMPT.md`,
+one item per iteration, committing as it goes, until the agent replies with the
+done sentinel — after which the branch is fetched back out of the sandbox.
+
+Recorded with [VHS](https://github.com/charmbracelet/vhs) in a throwaway
+repository: `./demo/setup-demo.sh` builds it and `vhs demo/demo.tape` re-records
+the GIF, so it can be refreshed whenever the output changes.
+
 ---
 
 ## Setup

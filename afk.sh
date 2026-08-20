@@ -24,6 +24,19 @@
 # Installed as `afk` by running install.sh; run `afk` as ./afk.sh if you'd rather not
 # install it. Both take the same subcommands.
 
+# CONTENTS
+#
+# The file is one section per concern, each opening with a banner comment. To
+# jump to one, search for its name in caps — it appears here and at the banner.
+#
+#   SETTINGS ............ the one list every setting is declared in
+#   OUTPUT .............. log/warn/die, and the spinner for the long waits
+#   SETTINGS RESOLUTION . find the repository, then env -> .afkrc -> defaults
+#   THE SANDBOX ......... make it, run things inside it, get the work back out
+#   AGENT PROFILES ...... claude, codex, copilot: flags in, final message out
+#   SUBCOMMANDS ......... one cmd_* each, in the order `usage` lists them
+#   DISPATCH ............ the usage text, and the case that routes argv
+
 set -uo pipefail
 
 # ==============================================================================
@@ -64,14 +77,79 @@ CONFIG_FILE=".afkrc"      # per-repository settings, at the repository root
 CONFIG_PATH=""            # set by load_repo_config when one was actually read
 
 # ==============================================================================
-# INTERNALS
+# OUTPUT
 # ==============================================================================
+#
+# Everything the user sees on the way past. All of it goes to stderr except
+# log(), so that a caller doing out=$(run_agent) still captures clean stdout.
 
 log()  { printf '\033[1;34m>>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
 
+# A spinner for the waits that are measured in minutes — the agent runs, mostly.
+# It writes to stderr, because every caller captures the command's stdout, and it
+# only animates on a terminal: piped or CI runs get one plain log line instead of
+# thousands of redraws. The work stays in the foreground so exit statuses survive;
+# it is the spinner that is backgrounded.
+SPIN_PID=""
+SPIN_MSG=""
+SPIN_T0=0
+
+elapsed() { printf '%dm%02ds' "$(( $1 / 60 ))" "$(( $1 % 60 ))"; }
+
+# Frames live in an array, not a string: substring expansion is byte-based in
+# bash 3.2 (what macOS ships) and would slice these multi-byte glyphs in half.
+_spin_draw() {
+  local msg="$1" f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 t0=$SECONDS
+  while :; do
+    printf '\r\033[2K\033[1;34m%s\033[0m %s  \033[2m%s\033[0m' \
+      "${f[i++ % ${#f[@]}]}" "$msg" "$(elapsed $(( SECONDS - t0 )))"
+    sleep 0.1
+  done
+}
+
+spin_start() {
+  SPIN_MSG="$1"; SPIN_T0=$SECONDS
+  [[ -t 2 && -z "${CI:-}${NO_COLOR:-}" ]] || { log "$SPIN_MSG"; return; }
+  _spin_draw "$SPIN_MSG" >&2 &
+  SPIN_PID=$!
+  # Without these a Ctrl-C, or a die() further down, leaves the spinner
+  # scribbling over the prompt.
+  trap 'spin_cancel; exit 130' INT TERM
+  trap spin_cancel EXIT
+}
+
+# Stop drawing and leave the line blank. Used on the paths that end badly, where
+# the error die() or warn() printed should be the last thing on screen.
+spin_cancel() {
+  [[ -n "$SPIN_PID" ]] || { SPIN_MSG=""; return; }
+  kill "$SPIN_PID" 2>/dev/null
+  wait "$SPIN_PID" 2>/dev/null
+  SPIN_PID=""; SPIN_MSG=""
+  printf '\r\033[2K' >&2
+}
+
+# Stop drawing and replace the line with how long the wait took.
+spin_stop() {
+  local msg="$SPIN_MSG"
+  spin_cancel
+  trap - INT TERM EXIT
+  [[ -n "$msg" ]] || return
+  log "$msg — done in $(elapsed $(( SECONDS - SPIN_T0 )))"
+}
+
 need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
+
+# ==============================================================================
+# SETTINGS RESOLUTION
+# ==============================================================================
+#
+# Three layers, highest first: the environment, $REPO/$CONFIG_FILE, the
+# defaults in SETTINGS. Where a value came from is recorded in AFK_SRC_<NAME>
+# so `config` can show it and `init` knows which lines to write out
+# uncommented. The repository is resolved first, because BOX defaults to its
+# directory name.
 
 # REPO = The repository afk operates on: the one containing the current directory.
 # Everything downstream — the directory mounted into the VM, the `git fetch` that
@@ -85,14 +163,6 @@ resolve_repo() {
   REPO="$(cd "$top" && /bin/pwd -P)" || die "cannot enter repository root: $top"
   cd "$REPO" || die "cannot enter repository root: $REPO"
 }
-
-# ==============================================================================
-# SETTINGS RESOLUTION
-# ==============================================================================
-#
-# Three layers, highest first: the environment, $REPO/$CONFIG_FILE, the defaults
-# in SETTINGS. Where a value came from is recorded in AFK_SRC_<NAME> so `config`
-# can show it and `init` knows which lines to write out uncommented.
 
 trim() {
   local s="$1"
@@ -214,6 +284,14 @@ report_config() {
   log "config: $CONFIG_FILE$out"
 }
 
+# ==============================================================================
+# THE SANDBOX
+# ==============================================================================
+#
+# The sbx microVM the agent runs in: making it, running commands inside it,
+# and getting the branch back out. Nothing here knows which agent is running
+# — that is AGENT PROFILES — and nothing here is a subcommand.
+
 box_exists() { sbx ls -q 2>/dev/null | grep -qx "$BOX"; }
 
 ensure_box() {
@@ -265,6 +343,38 @@ load_prompt() {
     SENTINEL_WARNED=1
     warn "$PROMPT_FILE never mentions $DONE_SENTINEL — the loop can only stop on MAX_ITERATIONS"
   fi
+}
+
+# Switch to $BRANCH, creating it only if it is missing.
+use_branch() {
+  in_box git checkout "$BRANCH" 2>/dev/null \
+    || in_box git checkout -b "$BRANCH" \
+    || die "could not switch to branch $BRANCH"
+}
+
+# extract - streams the branch out as a git bundle over `sbx exec`.
+#
+# Clone mode also adds a `sandbox-<name>` git remote to the host repo, but sbx
+# deletes that remote whenever the sandbox stops after the agent stops.
+# sbx exec always works — it starts a stopped sandbox — and its status chatter goes to
+# stderr, so the bundle on stdout stays intact.
+extract() {
+  [[ "$USE_CLONE" == "1" ]] || { log "not clone mode — work is already on disk"; return; }
+
+  local bundle="$LOG_DIR/$BRANCH.bundle"
+  log "fetching $BRANCH out of the sandbox"
+  in_box git bundle create - "$BRANCH" 2>/dev/null > "$bundle" \
+    || { warn "could not bundle $BRANCH out of the sandbox"; return; }
+
+  # Only keep bundle when the fetch failed and it is the sole copy on the host.
+  git fetch "$bundle" "$BRANCH:$BRANCH" 2>/dev/null \
+    && { rm -f "$bundle"; log "fetched. review with: git log --oneline $BRANCH"; return; }
+
+  # Never force merge back on the host — the sandbox's work is in the bundle either
+  # way, so let the user pick a name and diff the two themselves.
+  warn "could not fast-forward $BRANCH — it already exists here and has diverged"
+  warn "the sandbox's work is safe in $bundle; get it with:"
+  warn "  git fetch $bundle $BRANCH:$BRANCH-sandbox"
 }
 
 # ==============================================================================
@@ -366,6 +476,10 @@ esac
 # ==============================================================================
 # SUBCOMMANDS
 # ==============================================================================
+#
+# One cmd_* per command, in the order `usage` lists them: init, config, loop,
+# prompt, smoke, shell, remove. A helper used by exactly one of them sits
+# directly above it; anything shared lives in a section above.
 
 # Quote only when the value would not survive the parser unquoted.
 quote_value() {
@@ -449,62 +563,6 @@ cmd_config() {
   [[ -n "$CONFIG_PATH" ]] || log "no $CONFIG_FILE here — \`$(basename "$0") init\` writes one"
 }
 
-# afk smoke - test box + auth + network + model in current afk config
-cmd_smoke() {
-  ensure_box
-  log "workspace inside sandbox:"; in_box pwd
-  log "git status:";               in_box git status --short --branch
-  log "$AGENT version:";           in_box "$AGENT" --version
-  log "round-trip test (checks auth + network + model):"
-  build_agent_flags "Reply with exactly: PONG"
-  local out; out=$(run_agent)
-  agent_failed "$out" && { printf '%s\n' "$out" | tail -5; die "round-trip failed"; }
-  printf '%s\n' "$(agent_text "$out")"
-  log "smoke test passed"
-}
-
-# afk shell - drop in sandbox shell
-cmd_shell() { ensure_box; sbx exec -it "$BOX" bash; }
-
-# afk remove - remove sandbox
-cmd_remove() {
-  log "removing sandbox $BOX"
-  sbx rm -f "$BOX" 2>/dev/null || true
-  log "gone. next run will create it fresh."
-}
-
-# Switch to $BRANCH, creating it only if it is missing.
-use_branch() {
-  in_box git checkout "$BRANCH" 2>/dev/null \
-    || in_box git checkout -b "$BRANCH" \
-    || die "could not switch to branch $BRANCH"
-}
-
-# afk prompt - one agent run on a prompt you pass in.
-# Changes are collected through git fetch so tell the agent to commit any work it does in the sandbox
-cmd_prompt() {
-  local prompt="$*"
-  if [[ -z "$prompt" && ! -t 0 ]]; then prompt="$(cat)"; fi
-  [[ -n "${prompt//[[:space:]]/}" ]] \
-    || die "nothing to ask — usage: $(basename "$0") prompt <text>"
-
-  ensure_box
-  mkdir -p "$LOG_DIR"
-  use_branch
-
-  build_agent_flags "$prompt"
-  local out; out=$(run_agent)
-  local status=$?
-
-  printf '%s\n' "$out" > "$LOG_DIR/prompt.json"
-
-  [[ $status -ne 0 ]] && die "$AGENT exited $status — see $LOG_DIR/prompt.json"
-  agent_failed "$out" && die "$AGENT reported an error — see $LOG_DIR/prompt.json"
-
-  printf '%s\n' "$(agent_text "$out")"
-  in_box git log --oneline -1
-  extract
-}
 # afk loop - Runs agent in sandbox with $PROMPT_FILE as instructions
 cmd_loop() {
   ensure_box
@@ -522,8 +580,10 @@ cmd_loop() {
     build_agent_flags "$PROMPT"
 
     local before; before=$(head_sha)
+    spin_start "$AGENT working (iteration $i/$MAX_ITERATIONS)"
     local out; out=$(run_agent)
     local status=$?
+    spin_stop
 
     printf '%s\n' "$out" > "$LOG_DIR/iter-$i.json"
 
@@ -565,32 +625,65 @@ cmd_loop() {
   extract
 }
 
-# extract - streams the branch out as a git bundle over `sbx exec`.
-#
-# Clone mode also adds a `sandbox-<name>` git remote to the host repo, but sbx
-# deletes that remote whenever the sandbox stops after the agent stops.
-# sbx exec always works — it starts a stopped sandbox — and its status chatter goes to
-# stderr, so the bundle on stdout stays intact.
-extract() {
-  [[ "$USE_CLONE" == "1" ]] || { log "not clone mode — work is already on disk"; return; }
+# afk prompt - one agent run on a prompt you pass in.
+# Changes are collected through git fetch so tell the agent to commit any work it does in the sandbox
+cmd_prompt() {
+  local prompt="$*"
+  if [[ -z "$prompt" && ! -t 0 ]]; then prompt="$(cat)"; fi
+  [[ -n "${prompt//[[:space:]]/}" ]] \
+    || die "nothing to ask — usage: $(basename "$0") prompt <text>"
 
-  local bundle="$LOG_DIR/$BRANCH.bundle"
-  log "fetching $BRANCH out of the sandbox"
-  in_box git bundle create - "$BRANCH" 2>/dev/null > "$bundle" \
-    || { warn "could not bundle $BRANCH out of the sandbox"; return; }
+  ensure_box
+  mkdir -p "$LOG_DIR"
+  use_branch
 
-  # Only keep bundle when the fetch failed and it is the sole copy on the host.
-  git fetch "$bundle" "$BRANCH:$BRANCH" 2>/dev/null \
-    && { rm -f "$bundle"; log "fetched. review with: git log --oneline $BRANCH"; return; }
+  build_agent_flags "$prompt"
+  printf '\n'; spin_start "$AGENT working"
+  local out; out=$(run_agent)
+  local status=$?
+  spin_stop
 
-  # Never force merge back on the host — the sandbox's work is in the bundle either
-  # way, so let the user pick a name and diff the two themselves.
-  warn "could not fast-forward $BRANCH — it already exists here and has diverged"
-  warn "the sandbox's work is safe in $bundle; get it with:"
-  warn "  git fetch $bundle $BRANCH:$BRANCH-sandbox"
+  printf '%s\n' "$out" > "$LOG_DIR/prompt.json"
+
+  [[ $status -ne 0 ]] && die "$AGENT exited $status — see $LOG_DIR/prompt.json"
+  agent_failed "$out" && die "$AGENT reported an error — see $LOG_DIR/prompt.json"
+
+  printf '%s\n' "$(agent_text "$out")"
+  in_box git log --oneline -1
+  extract
+}
+
+# afk smoke - test box + auth + network + model in current afk config
+cmd_smoke() {
+  ensure_box
+  log "workspace inside sandbox:"; in_box pwd
+  log "git status:";               in_box git status --short --branch
+  log "$AGENT version:";           in_box "$AGENT" --version
+  log "round-trip test (checks auth + network + model):"
+  build_agent_flags "Reply with exactly: PONG"
+  spin_start "$AGENT working"
+  local out; out=$(run_agent)
+  spin_stop
+  agent_failed "$out" && { printf '%s\n' "$out" | tail -5; die "round-trip failed"; }
+  printf '%s\n' "$(agent_text "$out")"
+  log "smoke test passed"
+}
+
+# afk shell - drop in sandbox shell
+cmd_shell() { ensure_box; sbx exec -it "$BOX" bash; }
+
+# afk remove - remove sandbox
+cmd_remove() {
+  log "removing sandbox $BOX"
+  sbx rm -f "$BOX" 2>/dev/null || true
+  log "gone. next run will create it fresh."
 }
 
 # ==============================================================================
+# DISPATCH
+# ==============================================================================
+#
+# What `afk <command>` does before it does anything else.
 
 usage() {
   local me; me="$(basename "$0")"
