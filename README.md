@@ -15,6 +15,12 @@ review before merging.
 
 ## What it looks like
 
+- `afk init` freezes settings into `.afkrc` — `MAX_ITERATIONS` is explicitly set to 3 here. 
+- `afk config` shows every effective setting and where it came from. 
+- `afk prompt` is a single ad-hoc run with a text prompt. 
+- `afk loop` works through `PROMPT.md` until the agent replies with the
+done sentinel — after which the branch is fetched back out of the sandbox automatically.
+
 <p align="center">
   <img src="demo/afk.gif" width="900"
        alt="A terminal session: afk init writes .afkrc, afk config lists every
@@ -23,16 +29,9 @@ review before merging.
             reports the done sentinel.">
 </p>
 
-`afk init` freezes this repository's settings into `.afkrc` — here
-`MAX_ITERATIONS` comes from the environment, so that is the one line written
-uncommented. `afk config` then shows every effective setting and where it came
-from. `afk prompt` is a single ad-hoc run. `afk loop` works through `PROMPT.md`,
-one item per iteration, committing as it goes, until the agent replies with the
-done sentinel — after which the branch is fetched back out of the sandbox.
 
-Recorded with [VHS](https://github.com/charmbracelet/vhs) in a throwaway
-repository: `./demo/setup-demo.sh` builds it and `vhs demo/demo.tape` re-records
-the GIF, so it can be refreshed whenever the output changes.
+
+Recorded with [VHS](https://github.com/charmbracelet/vhs).
 
 ---
 
@@ -88,7 +87,7 @@ afk init             # write .afkrc for this repo (do this once, per repo)
 afk config           # show every effective setting and where it came from
 afk smoke            # verify sandbox + auth + network + model. Do before first run.
 afk loop             # run agent in loop with instructions from PROMPT_FILE
-afk prompt "<text>"  # run the agent once on an ad-hoc prompt
+afk prompt <text>    # run the agent once on an ad-hoc prompt
 afk shell            # drop into the sandbox shell
 afk remove           # destroy the sandbox
 afk                  # print the command list (no default subcommand)

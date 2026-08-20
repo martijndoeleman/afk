@@ -362,13 +362,13 @@ extract() {
   [[ "$USE_CLONE" == "1" ]] || { log "not clone mode — work is already on disk"; return; }
 
   local bundle="$LOG_DIR/$BRANCH.bundle"
-  log "fetching $BRANCH out of the sandbox"
+  log "fetching $BRANCH branch out of the sandbox"
   in_box git bundle create - "$BRANCH" 2>/dev/null > "$bundle" \
     || { warn "could not bundle $BRANCH out of the sandbox"; return; }
 
   # Only keep bundle when the fetch failed and it is the sole copy on the host.
   git fetch "$bundle" "$BRANCH:$BRANCH" 2>/dev/null \
-    && { rm -f "$bundle"; log "fetched. review with: git log --oneline $BRANCH"; return; }
+    && { rm -f "$bundle"; log "git branch fetched. review with: git log --oneline $BRANCH"; return; }
 
   # Never force merge back on the host — the sandbox's work is in the bundle either
   # way, so let the user pick a name and diff the two themselves.

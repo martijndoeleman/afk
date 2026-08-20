@@ -1,2 +1,3 @@
 # Per-iteration JSON logs and any bundle left behind by a failed extract.
 .afk-logs/
+.DS_Store
